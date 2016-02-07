@@ -2,10 +2,19 @@ Source: libiio
 Section: libs
 Priority: optional
 Maintainer: Paul Cercueil <paul.cercueil@analog.com>
-Build-Depends: cmake (>= 2.8), debhelper (>= 9), cli-common-dev (>= 0.9~), doxygen, python, dh-python
+Uploaders: A. Maitland Bottoms <bottoms@debian.org>
+Build-Depends: bison,
+               cli-common-dev (>= 0.9~),
+               cmake (>= 2.8),
+               debhelper (>= 9),
+               dh-python,
+               doxygen,
+               flex,
+               libxml2-dev,
+               python
 Standards-Version: 3.9.6
-Homepage: http://github.com/analogdevicesinc/libiio
-Vcs-Git: git://github.com/analogdevicesinc/libiio
+Homepage: https://github.com/analogdevicesinc/libiio
+Vcs-Git: https://github.com/analogdevicesinc/libiio.git
 
 Package: libiio0
 Architecture: any
@@ -33,7 +42,6 @@ Description: libiio development files
 
 Package: iiod
 Architecture: any
-Multi-Arch: no
 Depends: libiio0 (>= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends}
 Suggests: avahi-daemon
 Description: Daemon to share IIO devices on the network
@@ -43,7 +51,6 @@ Description: Daemon to share IIO devices on the network
 
 Package: libiio-utils
 Architecture: any
-Multi-Arch: no
 Depends: libiio0 (>= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends}
 Description: Miscellaneous libiio utilities
  Libiio is a library that has been conceived to ease the development of
@@ -55,7 +62,7 @@ Description: Miscellaneous libiio utilities
 Package: python-libiio
 Section: python
 Architecture: all
-Depends: libiio0 (>= ${binary:Version}), ${python:Depends}, ${misc:Depends}
+Depends: libiio0 (>= ${binary:Version}), ${misc:Depends}, ${python:Depends}
 Description: Python bindings for libiio
  Libiio is a library that has been conceived to ease the development of
  applications interfacing Industrial Input/Output (IIO) devices through
@@ -78,7 +85,7 @@ Package: libiio-cil-dev
 Section: cli-mono
 Architecture: all
 Depends: libiio0-cil (= ${binary:Version}), ${misc:Depends}
-Description: CLI bindings for libiio
+Description: CLI bindings for libiio (development)
  Libiio is a library that has been conceived to ease the development of
  applications interfacing Industrial Input/Output (IIO) devices through
  the IIO subsystem of the Linux kernel.
@@ -89,7 +96,7 @@ Description: CLI bindings for libiio
 Package: libiio0-doc
 Section: doc
 Architecture: all
-Depends: ${misc:Depends}
+Depends: libjs-jquery, ${misc:Depends}
 Description: libiio documentation
  Libiio is a library that has been conceived to ease the development of
  applications interfacing Industrial Input/Output (IIO) devices through
