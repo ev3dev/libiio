@@ -39,8 +39,12 @@ typedef long ssize_t;
 #endif
 
 #ifdef __GNUC__
+#ifndef __cnst
 #define __cnst __attribute__((const))
+#endif
+#ifndef __pure
 #define __pure __attribute__((pure))
+#endif
 #define __notused __attribute__((unused))
 #else
 #define __cnst
@@ -143,13 +147,11 @@ __api struct iio_context * iio_create_xml_context_mem(
 __api struct iio_context * iio_create_network_context(const char *host);
 
 
-/** @brief Create a context from USB devices
- * @param vid Vendor identification number
- * @param pid Product identification number
- * @return On success, a pointer to an iio_context structure
+/** @brief Create a context from a URI description
+ * @param uri A URI describing the context location
+ * @return On success, a pointer to a iio_context structure
  * @return On failure, NULL is returned and errno is set appropriately */
-__api struct iio_context * iio_create_usb_context(
-		unsigned short vid, unsigned short pid);
+__api struct iio_context * iio_create_context_from_uri(const char *uri);
 
 
 /** @brief Duplicate a pre-existing IIO context
@@ -233,7 +235,8 @@ __api __pure struct iio_device * iio_context_find_device(
 /** @brief Set a timeout for I/O operations
  * @param ctx A pointer to an iio_context structure
  * @param timeout_ms A positive integer representing the time in milliseconds
- * after which a timeout occurs
+ * after which a timeout occurs. A value of 0 is used to specify that no
+ * timeout should occur.
  * @return On success, 0 is returned
  * @return On error, a negative errno code is returned */
 __api int iio_context_set_timeout(
@@ -1317,5 +1320,7 @@ __api int iio_device_reg_read(struct iio_device *dev,
 #ifdef __cplusplus
 }
 #endif
+
+#undef __api
 
 #endif /* __IIO_H__ */

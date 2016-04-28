@@ -19,9 +19,9 @@
 #include "debug.h"
 #include "iio-private.h"
 
-#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -34,6 +34,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
 
@@ -76,6 +77,10 @@ struct block {
 	uint64_t timestamp;
 };
 
+struct iio_context_pdata {
+	unsigned int rw_timeout_ms;
+};
+
 struct iio_device_pdata {
 	int fd;
 	bool blocking;
@@ -104,6 +109,18 @@ static const char * const modifier_names[] = {
 	[IIO_MOD_LIGHT_RED] = "red",
 	[IIO_MOD_LIGHT_GREEN] = "green",
 	[IIO_MOD_LIGHT_BLUE] = "blue",
+	[IIO_MOD_QUATERNION] = "quaternion",
+	[IIO_MOD_TEMP_AMBIENT] = "ambient",
+	[IIO_MOD_TEMP_OBJECT] = "object",
+	[IIO_MOD_NORTH_MAGN] = "from_north_magnetic",
+	[IIO_MOD_NORTH_TRUE] = "from_north_true",
+	[IIO_MOD_NORTH_MAGN_TILT_COMP] = "from_north_magnetic_tilt_comp",
+	[IIO_MOD_NORTH_TRUE_TILT_COMP] = "from_north_true_tilt_comp",
+	[IIO_MOD_RUNNING] = "running",
+	[IIO_MOD_JOGGING] = "jogging",
+	[IIO_MOD_WALKING] = "walking",
+	[IIO_MOD_STILL] = "still",
+	[IIO_MOD_ROOT_SUM_SQUARED_X_Y_Z] = "sqrt(x^2+y^2+z^2)",
 	[IIO_MOD_I] = "i",
 	[IIO_MOD_Q] = "q",
 };
@@ -134,6 +151,17 @@ static unsigned int find_modifier(const char *s, size_t *len_p)
 	return IIO_NO_MOD;
 }
 
+static int ioctl_nointr(int fd, unsigned long request, void *data)
+{
+	int ret;
+
+	do {
+		ret = ioctl(fd, request, data);
+	} while (ret == -1 && errno == EINTR);
+
+	return ret;
+}
+
 static void local_free_pdata(struct iio_device *device)
 {
 	if (device && device->pdata) {
@@ -147,9 +175,11 @@ static void local_shutdown(struct iio_context *ctx)
 {
 	/* Free the backend data stored in every device structure */
 	unsigned int i;
-	for (i = 0; i < ctx->nb_devices; i++) {
+
+	for (i = 0; i < ctx->nb_devices; i++)
 		local_free_pdata(ctx->devices[i]);
-	}
+
+	free(ctx->pdata);
 }
 
 /** Shrinks the first nb characters of a string
@@ -212,18 +242,64 @@ static int set_channel_name(struct iio_channel *chn)
 	return 0;
 }
 
-static int device_check_ready(const struct iio_device *dev, short events)
+/*
+ * Used to generate the timeout parameter for operations like poll. Returns the
+ * number of ms until it is timeout_rel ms after the time specified in start. If
+ * timeout_rel is 0 returns -1 to indicate no timeout.
+ *
+ * The timeout that is specified for IIO operations is the maximum time a buffer
+ * push() or refill() operation should take before returning. poll() is used to
+ * wait for either data activity or for the timeout to elapse. poll() might get
+ * interrupted in which case it is called again or the read()/write() operation
+ * might not complete the full buffer size in one call in which case we go back
+ * to poll() again as well. Passing the same timeout as before would increase
+ * the total timeout and if repeated interruptions occur (e.g. by a timer
+ * signal) the operation might never time out or with significant delay. Hence
+ * before each poll() invocation the timeout is recalculated relative to the
+ * start of refill() or push() operation.
+ */
+static int get_rel_timeout_ms(struct timespec *start, unsigned int timeout_rel)
+{
+	struct timespec now;
+	int diff_ms;
+
+	if (timeout_rel == 0) /* No timeout */
+		return -1;
+
+	clock_gettime(CLOCK_MONOTONIC, &now);
+
+	diff_ms = (now.tv_sec - start->tv_sec) * 1000;
+	diff_ms += (now.tv_nsec - start->tv_nsec) / 1000000;
+
+	if (diff_ms >= timeout_rel) /* Expired */
+		return 0;
+	if (diff_ms > 0) /* Should never be false, but lets be safe */
+		timeout_rel -= diff_ms;
+	if (timeout_rel > INT_MAX)
+		return INT_MAX;
+
+	return (int) timeout_rel;
+}
+
+static int device_check_ready(const struct iio_device *dev, short events,
+	struct timespec *start)
 {
 	struct pollfd pollfd = {
 		.fd = dev->pdata->fd,
 		.events = events,
 	};
+	unsigned int rw_timeout_ms = dev->ctx->pdata->rw_timeout_ms;
+	int timeout_rel;
 	int ret;
 
 	if (!dev->pdata->blocking)
 		return 0;
 
-	ret = poll(&pollfd, 1, dev->ctx->rw_timeout_ms);
+	do {
+		timeout_rel = get_rel_timeout_ms(start, rw_timeout_ms);
+		ret = poll(&pollfd, 1, timeout_rel);
+	} while (ret == -1 && errno == EINTR);
+
 	if (ret < 0)
 		return -errno;
 	if (!ret)
@@ -235,19 +311,40 @@ static int device_check_ready(const struct iio_device *dev, short events)
 	return 0;
 }
 
-static ssize_t read_all(void *dst, size_t len, int fd)
+static ssize_t local_read(const struct iio_device *dev,
+		void *dst, size_t len, uint32_t *mask, size_t words)
 {
+	struct iio_device_pdata *pdata = dev->pdata;
 	uintptr_t ptr = (uintptr_t) dst;
+	struct timespec start;
 	ssize_t readsize;
-	int ret;
+	ssize_t ret;
+
+	if (pdata->fd == -1)
+		return -EBADF;
+	if (words != dev->words)
+		return -EINVAL;
+
+	memcpy(mask, dev->mask, words);
+
+	if (len == 0)
+		return 0;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
 
 	while (len > 0) {
+		ret = device_check_ready(dev, POLLIN, &start);
+		if (ret < 0)
+			break;
+
 		do {
-			ret = read(fd, (void *) ptr, len);
+			ret = read(pdata->fd, (void *) ptr, len);
 		} while (ret == -1 && errno == EINTR);
 
 		if (ret == -1) {
-			ret = -errno;
+			if (pdata->blocking && errno == EAGAIN)
+				continue;
+			ret = -EIO;
 			break;
 		} else if (ret == 0) {
 			ret = -EIO;
@@ -265,19 +362,37 @@ static ssize_t read_all(void *dst, size_t len, int fd)
 		return ret;
 }
 
-static ssize_t write_all(const void *src, size_t len, int fd)
+static ssize_t local_write(const struct iio_device *dev,
+		const void *src, size_t len)
 {
+	struct iio_device_pdata *pdata = dev->pdata;
 	uintptr_t ptr = (uintptr_t) src;
+	struct timespec start;
 	ssize_t writtensize;
-	int ret;
+	ssize_t ret;
+
+	if (pdata->fd == -1)
+		return -EBADF;
+
+	if (len == 0)
+		return 0;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
 
 	while (len > 0) {
+		ret = device_check_ready(dev, POLLOUT, &start);
+		if (ret < 0)
+			break;
+
 		do {
-			ret = write(fd, (void *) ptr, len);
+			ret = write(pdata->fd, (void *) ptr, len);
 		} while (ret == -1 && errno == EINTR);
 
 		if (ret == -1) {
-			ret = -errno;
+			if (pdata->blocking && errno == EAGAIN)
+				continue;
+
+			ret = -EIO;
 			break;
 		} else if (ret == 0) {
 			ret = -EIO;
@@ -310,72 +425,6 @@ static ssize_t local_enable_buffer(const struct iio_device *dev)
 	return 0;
 }
 
-static ssize_t local_read(const struct iio_device *dev,
-		void *dst, size_t len, uint32_t *mask, size_t words)
-{
-	ssize_t ret;
-	struct iio_device_pdata *pdata = dev->pdata;
-	if (pdata->fd == -1)
-		return -EBADF;
-	if (words != dev->words)
-		return -EINVAL;
-
-	ret = local_enable_buffer(dev);
-	if (ret < 0)
-		return ret;
-
-	ret = device_check_ready(dev, POLLIN);
-	if (ret < 0)
-		return ret;
-
-	memcpy(mask, dev->mask, words);
-	ret = read_all(dst, len, pdata->fd);
-
-	return ret ? ret : -EIO;
-}
-
-static ssize_t local_write(const struct iio_device *dev,
-		const void *src, size_t len)
-{
-	ssize_t ret;
-	struct iio_device_pdata *pdata = dev->pdata;
-	if (pdata->fd == -1)
-		return -EBADF;
-
-	/* Writing is forbidden in cyclic mode with devices without the
-	 * high-speed mmap interface, except for the devices starting with
-	 * "cf-": in this case only cyclic mode is allowed. */
-	if (!pdata->is_high_speed && pdata->cyclic !=
-			(dev->name && !strncmp(dev->name, "cf-", 3)))
-		return -EPERM;
-
-	if (pdata->cyclic) {
-		ret = device_check_ready(dev, POLLOUT);
-		if (ret < 0)
-			return ret;
-
-		ret = write(pdata->fd, src, len);
-		if (ret < 0)
-			return -errno;
-	}
-
-	ret = local_enable_buffer(dev);
-	if (ret < 0)
-		return ret;
-
-	/* In cyclic mode, the buffer must be enabled after writing the samples.
-	 * In non-cyclic mode, it must be enabled before writing the samples. */
-	if (!pdata->cyclic) {
-		ret = device_check_ready(dev, POLLOUT);
-		if (ret < 0)
-			return ret;
-
-		ret = write_all(src, len, pdata->fd);
-	}
-
-	return ret ? ret : -EIO;
-}
-
 static int local_set_kernel_buffers_count(const struct iio_device *dev,
 		unsigned int nb_blocks)
 {
@@ -395,6 +444,8 @@ static ssize_t local_get_buffer(const struct iio_device *dev,
 {
 	struct block block;
 	struct iio_device_pdata *pdata = dev->pdata;
+	struct timespec start;
+	char err_str[1024];
 	int f = pdata->fd;
 	ssize_t ret;
 
@@ -404,10 +455,6 @@ static ssize_t local_get_buffer(const struct iio_device *dev,
 		return -EBADF;
 	if (!addr_ptr)
 		return -EINVAL;
-
-	ret = (ssize_t) device_check_ready(dev, POLLIN | POLLOUT);
-	if (ret < 0)
-		return ret;
 
 	if (pdata->last_dequeued >= 0) {
 		struct block *last_block = &pdata->blocks[pdata->last_dequeued];
@@ -420,11 +467,12 @@ static ssize_t local_get_buffer(const struct iio_device *dev,
 		}
 
 		last_block->bytes_used = bytes_used;
-		ret = (ssize_t) ioctl(f,
+		ret = (ssize_t) ioctl_nointr(f,
 				BLOCK_ENQUEUE_IOCTL, last_block);
 		if (ret) {
 			ret = (ssize_t) -errno;
-			ERROR("Unable to enqueue block: %s\n", strerror(errno));
+			iio_strerror(errno, err_str, sizeof(err_str));
+			ERROR("Unable to enqueue block: %s\n", err_str);
 			return ret;
 		}
 
@@ -434,11 +482,23 @@ static ssize_t local_get_buffer(const struct iio_device *dev,
 		}
 	}
 
-	memset(&block, 0, sizeof(block));
-	ret = (ssize_t) ioctl(f, BLOCK_DEQUEUE_IOCTL, &block);
+	clock_gettime(CLOCK_MONOTONIC, &start);
+
+	do {
+		ret = (ssize_t) device_check_ready(dev, POLLIN | POLLOUT, &start);
+		if (ret < 0)
+			return ret;
+
+		memset(&block, 0, sizeof(block));
+		ret = (ssize_t) ioctl_nointr(f, BLOCK_DEQUEUE_IOCTL, &block);
+	} while (pdata->blocking && ret == -1 && errno == EAGAIN);
+
 	if (ret) {
 		ret = (ssize_t) -errno;
-		ERROR("Unable to dequeue block: %s\n", strerror(errno));
+		if (!pdata->blocking && ret != -EAGAIN) {
+			iio_strerror(errno, err_str, sizeof(err_str));
+			ERROR("Unable to dequeue block: %s\n", err_str);
+		}
 		return ret;
 	}
 
@@ -462,7 +522,7 @@ static ssize_t local_read_all_dev_attrs(const struct iio_device *dev,
 		/* Recursive! */
 		ssize_t ret = local_read_dev_attr(dev, attrs[i],
 				ptr + 4, len - 4, is_debug);
-		*(uint32_t *) ptr = htonl(ret);
+		*(uint32_t *) ptr = iio_htobe32(ret);
 
 		/* Align the length to 4 bytes */
 		if (ret > 0 && ret & 3)
@@ -484,7 +544,7 @@ static ssize_t local_read_all_chn_attrs(const struct iio_channel *chn,
 		/* Recursive! */
 		ssize_t ret = local_read_chn_attr(chn,
 				chn->attrs[i].name, ptr + 4, len - 4);
-		*(uint32_t *) ptr = htonl(ret);
+		*(uint32_t *) ptr = iio_htobe32(ret);
 
 		/* Align the length to 4 bytes */
 		if (ret > 0 && ret & 3)
@@ -504,7 +564,7 @@ static int local_buffer_analyze(unsigned int nb, const char *src, size_t len)
 		if (len < 4)
 			return -EINVAL;
 
-		val = (int32_t) ntohl(*(uint32_t *) src);
+		val = (int32_t) iio_be32toh(*(uint32_t *) src);
 		src += 4;
 		len -= 4;
 
@@ -537,7 +597,7 @@ static ssize_t local_write_all_dev_attrs(const struct iio_device *dev,
 
 	/* Second step: write the attributes */
 	for (i = 0; i < nb; i++) {
-		int32_t val = (int32_t) ntohl(*(uint32_t *) ptr);
+		int32_t val = (int32_t) iio_be32toh(*(uint32_t *) ptr);
 		ptr += 4;
 
 		if (val > 0) {
@@ -565,7 +625,7 @@ static ssize_t local_write_all_chn_attrs(const struct iio_channel *chn,
 
 	/* Second step: write the attributes */
 	for (i = 0; i < nb; i++) {
-		int32_t val = (int32_t) ntohl(*(uint32_t *) ptr);
+		int32_t val = (int32_t) iio_be32toh(*(uint32_t *) ptr);
 		ptr += 4;
 
 		if (val > 0) {
@@ -597,7 +657,7 @@ static ssize_t local_read_dev_attr(const struct iio_device *dev,
 	else
 		snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
 				dev->id, attr);
-	f = fopen(buf, "r");
+	f = fopen(buf, "re");
 	if (!f)
 		return -errno;
 
@@ -627,7 +687,7 @@ static ssize_t local_write_dev_attr(const struct iio_device *dev,
 	else
 		snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
 				dev->id, attr);
-	f = fopen(buf, "w");
+	f = fopen(buf, "we");
 	if (!f)
 		return -errno;
 
@@ -712,7 +772,7 @@ static int enable_high_speed(const struct iio_device *dev)
 		iio_device_get_sample_size_mask(dev, dev->mask, dev->words);
 	req.count = pdata->nb_blocks;
 
-	ret = ioctl(fd, BLOCK_ALLOC_IOCTL, &req);
+	ret = ioctl_nointr(fd, BLOCK_ALLOC_IOCTL, &req);
 	if (ret < 0) {
 		ret = -errno;
 		goto err_freemem;
@@ -724,13 +784,13 @@ static int enable_high_speed(const struct iio_device *dev)
 	/* mmap all the blocks */
 	for (i = 0; i < pdata->nb_blocks; i++) {
 		pdata->blocks[i].id = i;
-		ret = ioctl(fd, BLOCK_QUERY_IOCTL, &pdata->blocks[i]);
+		ret = ioctl_nointr(fd, BLOCK_QUERY_IOCTL, &pdata->blocks[i]);
 		if (ret) {
 			ret = -errno;
 			goto err_munmap;
 		}
 
-		ret = ioctl(fd, BLOCK_ENQUEUE_IOCTL, &pdata->blocks[i]);
+		ret = ioctl_nointr(fd, BLOCK_ENQUEUE_IOCTL, &pdata->blocks[i]);
 		if (ret) {
 			ret = -errno;
 			goto err_munmap;
@@ -751,7 +811,7 @@ static int enable_high_speed(const struct iio_device *dev)
 err_munmap:
 	for (; i > 0; i--)
 		munmap(pdata->addrs[i - 1], pdata->blocks[i - 1].size);
-	ioctl(fd, BLOCK_FREE_IOCTL, 0);
+	ioctl_nointr(fd, BLOCK_FREE_IOCTL, 0);
 err_freemem:
 	free(pdata->addrs);
 	pdata->addrs = NULL;
@@ -782,7 +842,7 @@ static int local_open(const struct iio_device *dev,
 		return ret;
 
 	snprintf(buf, sizeof(buf), "/dev/%s", dev->id);
-	pdata->fd = open(buf, O_RDWR);
+	pdata->fd = open(buf, O_RDWR | O_CLOEXEC | O_NONBLOCK);
 	if (pdata->fd == -1)
 		return -errno;
 
@@ -815,6 +875,10 @@ static int local_open(const struct iio_device *dev,
 		unsigned long size = samples_count * pdata->nb_blocks;
 		WARNING("High-speed mode not enabled\n");
 
+		/* Cyclic mode is only supported in high-speed mode */
+		if (cyclic)
+			return -EPERM;
+
 		/* Increase the size of the kernel buffer, when using the
 		 * low-speed interface. This avoids losing samples when
 		 * refilling the iio_buffer. */
@@ -823,15 +887,11 @@ static int local_open(const struct iio_device *dev,
 				buf, strlen(buf) + 1, false);
 		if (ret < 0)
 			goto err_close;
-
-		/* NOTE: The low-speed interface will enable the buffer after
-		 * the first samples are written, or if the device is set
-		 * to non blocking-mode */
-	} else {
-		ret = local_enable_buffer(dev);
-		if (ret < 0)
-			goto err_close;
 	}
+
+	ret = local_enable_buffer(dev);
+	if (ret < 0)
+		goto err_close;
 
 	return 0;
 err_close:
@@ -852,7 +912,7 @@ static int local_close(const struct iio_device *dev)
 		unsigned int i;
 		for (i = 0; i < pdata->nb_blocks; i++)
 			munmap(pdata->addrs[i], pdata->blocks[i].size);
-		ioctl(pdata->fd, BLOCK_FREE_IOCTL, 0);
+		ioctl_nointr(pdata->fd, BLOCK_FREE_IOCTL, 0);
 		free(pdata->addrs);
 		pdata->addrs = NULL;
 		free(pdata->blocks);
@@ -878,28 +938,15 @@ static int local_get_fd(const struct iio_device *dev)
 
 static int local_set_blocking_mode(const struct iio_device *dev, bool blocking)
 {
-	int ret;
-
 	if (dev->pdata->fd == -1)
 		return -EBADF;
 
 	if (dev->pdata->cyclic)
 		return -EPERM;
 
-	ret = set_blocking_mode(dev->pdata->fd, blocking);
-	if (ret == 0) {
-		dev->pdata->blocking = blocking;
+	dev->pdata->blocking = blocking;
 
-		/* When a device is opened, it is configured in blocking mode.
-		 * If the user wants to use the non blocking API, and poll the
-		 * device to know when to make the first read, it is required to
-		 * activate to buffer automatically when the device is switched
-		 * in non-blocking mode. */
-		if (!blocking)
-			ret = local_enable_buffer(dev);
-	}
-
-	return ret;
+	return 0;
 }
 
 static int local_get_trigger(const struct iio_device *dev,
@@ -945,7 +992,6 @@ static int local_set_trigger(const struct iio_device *dev,
 
 static bool is_channel(const char *attr, bool strict)
 {
-	unsigned int i;
 	char *ptr = NULL;
 	if (!strncmp(attr, "in_timestamp_", sizeof("in_timestamp_") - 1))
 		return true;
@@ -1107,7 +1153,7 @@ static int add_device_to_context(struct iio_context *ctx,
 static struct iio_channel *create_channel(struct iio_device *dev,
 		char *id, const char *attr, const char *path)
 {
-	struct iio_channel *chn = calloc(1, sizeof(*chn));
+	struct iio_channel *chn = zalloc(sizeof(*chn));
 	if (!chn)
 		return NULL;
 
@@ -1171,7 +1217,7 @@ static int add_channel(struct iio_device *dev, const char *name,
  */
 static unsigned int is_global_attr(struct iio_channel *chn, const char *attr)
 {
-	unsigned int i, len;
+	unsigned int len;
 	char *ptr;
 
 	if (!chn->is_output && !strncmp(attr, "in_", 3))
@@ -1258,7 +1304,6 @@ static int detect_and_move_global_attrs(struct iio_device *dev)
 	/* Find channels without an index */
 	for (i = 0; i < dev->nb_attrs; i++) {
 		const char *attr = dev->attrs[i];
-		bool match;
 		int ret;
 
 		if (!dev->attrs[i])
@@ -1280,13 +1325,17 @@ static int detect_and_move_global_attrs(struct iio_device *dev)
 	}
 
 	dev->nb_attrs = ptr - dev->attrs;
+	if (!dev->nb_attrs) {
+		free(dev->attrs);
+		dev->attrs = NULL;
+	}
+
 	return 0;
 }
 
 static int add_attr_or_channel_helper(struct iio_device *dev,
 		const char *path, bool dir_is_scan_elements)
 {
-	int ret;
 	char buf[1024];
 	const char *name = strrchr(path, '/') + 1;
 
@@ -1394,11 +1443,11 @@ static int create_device(void *d, const char *path)
 	unsigned int i;
 	int ret;
 	struct iio_context *ctx = d;
-	struct iio_device *dev = calloc(1, sizeof(*dev));
+	struct iio_device *dev = zalloc(sizeof(*dev));
 	if (!dev)
 		return -ENOMEM;
 
-	dev->pdata = calloc(1, sizeof(*dev->pdata));
+	dev->pdata = zalloc(sizeof(*dev->pdata));
 	if (!dev->pdata) {
 		free(dev);
 		return -ENOMEM;
@@ -1488,7 +1537,7 @@ static int add_debug(void *d, const char *path)
 
 static int local_set_timeout(struct iio_context *ctx, unsigned int timeout)
 {
-	ctx->rw_timeout_ms = timeout;
+	ctx->pdata->rw_timeout_ms = timeout;
 	return 0;
 }
 
@@ -1583,12 +1632,19 @@ struct iio_context * local_create_context(void)
 	int ret = -ENOMEM;
 	unsigned int len;
 	struct utsname uts;
-	struct iio_context *ctx = calloc(1, sizeof(*ctx));
+	struct iio_context *ctx = zalloc(sizeof(*ctx));
 	if (!ctx)
 		goto err_set_errno;
 
 	ctx->ops = &local_ops;
 	ctx->name = "local";
+
+	ctx->pdata = zalloc(sizeof(*ctx->pdata));
+	if (!ctx->pdata) {
+		free(ctx);
+		goto err_set_errno;
+	}
+
 	local_set_timeout(ctx, DEFAULT_TIMEOUT_MS);
 
 	uname(&uts);
@@ -1596,6 +1652,7 @@ struct iio_context * local_create_context(void)
 		+ strlen(uts.version) + strlen(uts.machine);
 	ctx->description = malloc(len + 5); /* 4 spaces + EOF */
 	if (!ctx->description) {
+		free(ctx->pdata);
 		free(ctx);
 		goto err_set_errno;
 	}

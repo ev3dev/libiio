@@ -262,31 +262,47 @@ struct iio_context * iio_context_clone(const struct iio_context *ctx)
 	}
 }
 
-#if USB_BACKEND
-static struct iio_context * iio_create_usb_context_from_string(const char *dev)
+struct iio_context * iio_create_context_from_uri(const char *uri)
 {
-	unsigned short vid, pid;
-
-	if ((sscanf(dev, "0x%04hx:0x%04hx", &vid, &pid) != 2) &&
-			sscanf(dev, "%04hx:%04hx", &vid, &pid) != 2) {
-		errno = EINVAL;
-		return NULL;
-	}
-
-	return usb_create_context(vid, pid);
-}
+#if LOCAL_BACKEND
+	if (strcmp(uri, "local:") == 0) /* No address part */
+		return iio_create_local_context();
 #endif
+
+#if XML_BACKEND
+	if (strncmp(uri, "xml:", sizeof("xml:") - 1) == 0)
+		return iio_create_xml_context(uri + sizeof("xml:") - 1);
+#endif
+
+#if NETWORK_BACKEND
+	if (strncmp(uri, "ip:", sizeof("ip:") - 1) == 0)
+		return iio_create_network_context(uri+3);
+#endif
+
+#if USB_BACKEND
+	if (strncmp(uri, "usb:", sizeof("usb:") - 1) == 0)
+		return usb_create_context_from_uri(uri);
+#endif
+
+#if SERIAL_BACKEND
+	if (strncmp(uri, "serial:", sizeof("serial:") - 1) == 0)
+		return serial_create_context_from_uri(uri);
+#endif
+
+	errno = ENOSYS;
+	return NULL;
+}
 
 struct iio_context * iio_create_default_context(void)
 {
 	char *hostname = getenv("IIOD_REMOTE");
 
 	if (hostname) {
-#if USB_BACKEND
-		/* If it contains a colon, create a USB context */
-		if (strchr(hostname, ':'))
-			return iio_create_usb_context_from_string(hostname);
-#endif
+		struct iio_context *ctx;
+
+		ctx = iio_create_context_from_uri(hostname);
+		if (ctx)
+			return ctx;
 
 #if NETWORK_BACKEND
 		/* If the environment variable is an empty string, we will
@@ -333,19 +349,8 @@ struct iio_context * iio_create_xml_context_mem(const char *xml, size_t len)
 
 struct iio_context * iio_create_xml_context(const char *xml_file)
 {
-#if NETWORK_BACKEND
+#if XML_BACKEND
 	return xml_create_context(xml_file);
-#else
-	errno = ENOSYS;
-	return NULL;
-#endif
-}
-
-struct iio_context * iio_create_usb_context(
-		unsigned short vid, unsigned short pid)
-{
-#if USB_BACKEND
-	return usb_create_context(vid, pid);
 #else
 	errno = ENOSYS;
 	return NULL;

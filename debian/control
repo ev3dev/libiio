@@ -12,7 +12,7 @@ Build-Depends: bison,
                flex,
                libxml2-dev,
                python
-Standards-Version: 3.9.6
+Standards-Version: 3.9.8
 Homepage: https://github.com/analogdevicesinc/libiio
 Vcs-Git: https://github.com/analogdevicesinc/libiio.git
 
@@ -43,6 +43,7 @@ Description: libiio development files
 Package: iiod
 Architecture: any
 Depends: libiio0 (>= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends}
+Section: net
 Suggests: avahi-daemon
 Description: Daemon to share IIO devices on the network
  IIOD is a network daemon that communicates with the network backend of libiio.
@@ -72,7 +73,7 @@ Description: Python bindings for libiio
 
 Package: libiio0-cil
 Section: cli-mono
-Architecture: all
+Architecture: any
 Depends: libiio0 (>= ${binary:Version}), ${cli:Depends}, ${misc:Depends}
 Description: CLI bindings for libiio
  Libiio is a library that has been conceived to ease the development of

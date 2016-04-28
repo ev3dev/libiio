@@ -13,7 +13,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
 # Lesser General Public License for more details.
 
-from ctypes import Structure, c_char_p, c_uint, c_int, c_ushort, \
+from ctypes import Structure, c_char_p, c_uint, c_int, \
 		c_char, c_void_p, c_bool, create_string_buffer, \
 		POINTER as _POINTER, cdll as _cdll, memmove as _memmove, byref as _byref
 from os import strerror as _strerror
@@ -61,14 +61,13 @@ _new_network.restype = _ContextPtr
 _new_network.argtypes = (c_char_p, )
 _new_network.errcheck = _checkNull
 
-_new_usb = _lib.iio_create_usb_context
-_new_usb.restype = _ContextPtr
-_new_usb.argtypes = (c_ushort, c_ushort, )
-_new_usb.errcheck = _checkNull
-
 _new_default = _lib.iio_create_default_context
 _new_default.restype = _ContextPtr
 _new_default.errcheck = _checkNull
+
+_new_uri = _lib.iio_create_context_from_uri
+_new_uri.restype = _ContextPtr
+_new_uri.errcheck = _checkNull
 
 _destroy = _lib.iio_context_destroy
 _destroy.argtypes = (_ContextPtr, )
@@ -163,10 +162,12 @@ _d_write_debug_attr.errcheck = _checkNegative
 _d_reg_write = _lib.iio_device_reg_write
 _d_reg_write.restype = c_int
 _d_reg_write.argtypes = (_DevicePtr, c_uint, c_uint)
+_d_reg_write.errcheck = _checkNegative
 
 _d_reg_read = _lib.iio_device_reg_read
 _d_reg_read.restype = c_int
 _d_reg_read.argtypes = (_DevicePtr, c_uint, _POINTER(c_uint))
+_d_reg_read.errcheck = _checkNegative
 
 _channels_count = _lib.iio_device_get_channels_count
 _channels_count.restype = c_uint
@@ -665,6 +666,8 @@ class Context(object):
 		"""
 		if(_context is None):
 			self._context = _new_default()
+		elif type(_context) is str:
+			self._context = _new_uri(_context)
 		else:
 			self._context = _context
 
@@ -769,20 +772,3 @@ class NetworkContext(Context):
 		"""
 		ctx = _new_network(hostname)
 		super(NetworkContext, self).__init__(ctx)
-
-class UsbContext(Context):
-	def __init__(self, vid, pid):
-		"""
-		Initialize a new instance of the Context class, with the USB device corresponding to the given VID/PID.
-
-		parameters:
-			vid: type=int
-				The Vendor identification number of the USB device
-			pid: type=int
-				The Product identification number of the USB device
-
-		returns: type=iio.UsbContext
-			A new instance of this class
-		"""
-		ctx = _new_usb(vid, pid)
-		super(UsbContext, self).__init__(ctx)

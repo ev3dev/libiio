@@ -16,23 +16,13 @@
  *
  * */
 
+#include "debug.h"
 #include "iio-private.h"
 
+#include <inttypes.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
-
-/* Include <winsock2.h> or <arpa/inet.h> for ntohl() */
-#ifdef _WIN32
-#include <winsock2.h>
-#else
-#include <arpa/inet.h>
-#endif
-
-/* winsock2.h defines ERROR, we don't want that */
-#undef ERROR
-
-#include "debug.h"
 
 static char *get_attr_xml(const char *attr, size_t *length, bool is_debug)
 {
@@ -700,7 +690,7 @@ int iio_device_reg_write(struct iio_device *dev,
 	ssize_t ret;
 
 	char buf[1024];
-	snprintf(buf, sizeof(buf), "0x%x 0x%x", address, value);
+	snprintf(buf, sizeof(buf), "0x%" PRIx32 " 0x%" PRIx32, address, value);
 	ret = iio_device_debug_attr_write(dev, "direct_reg_access", buf);
 
 	return ret < 0 ? ret : 0;
@@ -756,7 +746,7 @@ static int read_each_attr(struct iio_device *dev, bool is_debug,
 
 	for (i = 0; i < count; i++) {
 		const char *attr;
-		int32_t len = (int32_t) ntohl(*(uint32_t *) ptr);
+		int32_t len = (int32_t) iio_be32toh(*(uint32_t *) ptr);
 
 		if (is_debug)
 			attr = iio_device_get_debug_attr(dev, i);
@@ -814,7 +804,7 @@ static int write_each_attr(struct iio_device *dev, bool is_debug,
 		if (ret < 0)
 			goto err_free_buf;
 
-		*(int32_t *) ptr = (int32_t) htonl((uint32_t) ret);
+		*(int32_t *) ptr = (int32_t) iio_htobe32((uint32_t) ret);
 		ptr += 4;
 		len -= 4;
 

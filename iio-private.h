@@ -24,9 +24,29 @@
 
 #include <stdbool.h>
 
-#ifdef _WIN32
+#ifdef _MSC_BUILD
 #define snprintf sprintf_s
+#define inline __inline
+#endif
+#ifdef _WIN32
 #define strerror_r(err, buf, len) strerror_s(buf, len, err)
+#else
+/* Visual Studio is unhappy with strdup(); so we make libiio use the C++
+ * compliant _strdup() on Windows, and revert to the POSIX strdup() everywhere
+ * else.*/
+#define _strdup strdup
+#endif
+
+#ifdef _WIN32
+#   ifdef LIBIIO_EXPORTS
+#	define __api __declspec(dllexport)
+#   else
+#	define __api __declspec(dllimport)
+#   endif
+#elif __GNUC__ >= 4
+#   define __api __attribute__((visibility ("default")))
+#else
+#   define __api
 #endif
 
 #define ARRAY_SIZE(x) (sizeof(x) ? sizeof(x) / sizeof((x)[0]) : 0)
@@ -40,11 +60,48 @@
 #define CLEAR_BIT(addr, bit) \
 	*(((uint32_t *) addr) + BIT_WORD(bit)) &= ~BIT_MASK(bit)
 
+
+/* ntohl/htonl are a nightmare to use in cross-platform applications,
+ * since they are defined in different headers on different platforms.
+ * iio_be32toh/iio_htobe32 are just clones of ntohl/htonl. */
+static inline uint32_t iio_be32toh(uint32_t word)
+{
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#ifdef __GNUC__
+	return __builtin_bswap32(word);
+#else
+	return ((word & 0xff) << 24) | ((word & 0xff00) << 8) |
+		((word >> 8) & 0xff00) | ((word >> 24) & 0xff);
+#endif
+#else
+	return word;
+#endif
+}
+
+static inline uint32_t iio_htobe32(uint32_t word)
+{
+	return iio_be32toh(word);
+}
+
+/* Allocate zeroed out memory */
+static inline void *zalloc(size_t size)
+{
+	return calloc(1, size);
+}
+
 enum iio_modifier {
 	IIO_NO_MOD,
 	IIO_MOD_X,
 	IIO_MOD_Y,
 	IIO_MOD_Z,
+	IIO_MOD_X_AND_Y,
+	IIO_MOD_X_AND_Z,
+	IIO_MOD_Y_AND_Z,
+	IIO_MOD_X_AND_Y_AND_Z,
+	IIO_MOD_X_OR_Y,
+	IIO_MOD_X_OR_Z,
+	IIO_MOD_Y_OR_Z,
+	IIO_MOD_X_OR_Y_OR_Z,
 	IIO_MOD_LIGHT_BOTH,
 	IIO_MOD_LIGHT_IR,
 	IIO_MOD_ROOT_SUM_SQUARED_X_Y,
@@ -53,6 +110,18 @@ enum iio_modifier {
 	IIO_MOD_LIGHT_RED,
 	IIO_MOD_LIGHT_GREEN,
 	IIO_MOD_LIGHT_BLUE,
+	IIO_MOD_QUATERNION,
+	IIO_MOD_TEMP_AMBIENT,
+	IIO_MOD_TEMP_OBJECT,
+	IIO_MOD_NORTH_MAGN,
+	IIO_MOD_NORTH_TRUE,
+	IIO_MOD_NORTH_MAGN_TILT_COMP,
+	IIO_MOD_NORTH_TRUE_TILT_COMP,
+	IIO_MOD_RUNNING,
+	IIO_MOD_JOGGING,
+	IIO_MOD_WALKING,
+	IIO_MOD_STILL,
+	IIO_MOD_ROOT_SUM_SQUARED_X_Y_Z,
 	IIO_MOD_I,
 	IIO_MOD_Q,
 };
@@ -117,8 +186,6 @@ struct iio_context {
 	unsigned int nb_devices;
 
 	char *xml;
-
-	unsigned int rw_timeout_ms;
 };
 
 struct iio_channel {
@@ -195,10 +262,15 @@ struct iio_context * local_create_context(void);
 struct iio_context * network_create_context(const char *hostname);
 struct iio_context * xml_create_context_mem(const char *xml, size_t len);
 struct iio_context * xml_create_context(const char *xml_file);
-struct iio_context * usb_create_context(unsigned short vid, unsigned short pid);
+struct iio_context * usb_create_context(unsigned int bus, unsigned int address,
+		unsigned int interface);
+struct iio_context * usb_create_context_from_uri(const char *uri);
+struct iio_context * serial_create_context_from_uri(const char *uri);
 
 /* This function is not part of the API, but is used by the IIO daemon */
 __api ssize_t iio_device_get_sample_size_mask(const struct iio_device *dev,
 		const uint32_t *mask, size_t words);
+
+#undef __api
 
 #endif /* __IIO_PRIVATE_H__ */

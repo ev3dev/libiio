@@ -24,21 +24,30 @@
 #include <errno.h>
 #include <limits.h>
 #include <pthread.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <string.h>
 #include <sys/queue.h>
+#include <sys/eventfd.h>
 #include <time.h>
+#include <fcntl.h>
+#include <signal.h>
 
 int yyparse(yyscan_t scanner);
 
+struct DevEntry;
+
 /* Corresponds to a thread reading from a device */
 struct ThdEntry {
-	SLIST_ENTRY(ThdEntry) next;
+	SLIST_ENTRY(ThdEntry) parser_list_entry;
+	SLIST_ENTRY(ThdEntry) dev_list_entry;
 	pthread_cond_t cond;
-	pthread_mutex_t cond_lock;
 	unsigned int nb, sample_size, samples_count;
 	ssize_t err;
+
 	struct parser_pdata *pdata;
+	struct iio_device *dev;
+	struct DevEntry *entry;
 
 	uint32_t *mask;
 	bool active, is_writer, new_client, wait_for_open;
@@ -46,13 +55,15 @@ struct ThdEntry {
 
 /* Corresponds to an opened device */
 struct DevEntry {
-	SLIST_ENTRY(DevEntry) next;
+	unsigned int ref_count;
 
 	struct iio_device *dev;
 	struct iio_buffer *buf;
+	int buf_fd;
 	unsigned int sample_size, nb_clients;
 	bool update_mask;
 	bool cyclic;
+	bool closed;
 
 	/* Linked list of ThdEntry structures corresponding
 	 * to all the threads who opened the device */
@@ -60,10 +71,6 @@ struct DevEntry {
 	pthread_mutex_t thdlist_lock;
 
 	pthread_t thd;
-	pthread_attr_t attr;
-
-	pthread_cond_t last_cond;
-	pthread_mutex_t last_lock;
 
 	uint32_t *mask;
 	size_t nb_words;
@@ -75,42 +82,207 @@ struct sample_cb_info {
 	uint32_t *mask;
 };
 
-/* This is a linked list of DevEntry structures corresponding to
- * all the devices which have threads trying to read them */
-static SLIST_HEAD(DevHead, DevEntry) devlist_head =
-	    SLIST_HEAD_INITIALIZER(DevHead);
+/* Protects iio_device_{set,get}_data() from concurrent access from multiple
+ * clients */
 static pthread_mutex_t devlist_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#if WITH_AIO
+static ssize_t async_io(struct parser_pdata *pdata, void *buf, size_t len,
+	bool do_read)
+{
+	ssize_t ret;
+	struct pollfd pfd[2];
+	unsigned int num_pfds;
+	struct iocb iocb;
+	struct iocb *ios[1];
+	struct io_event e[1];
+
+	ios[0] = &iocb;
+
+	if (do_read)
+		io_prep_pread(&iocb, pdata->fd_in, buf, len, 0);
+	else
+		io_prep_pwrite(&iocb, pdata->fd_out, buf, len, 0);
+
+	io_set_eventfd(&iocb, pdata->aio_eventfd);
+
+	ret = io_submit(pdata->aio_ctx, 1, ios);
+	if (ret != 1) {
+		ERROR("Failed to submit IO operation: %zd\n", ret);
+		return -EIO;
+	}
+
+	pfd[0].fd = pdata->aio_eventfd;
+	pfd[0].events = POLLIN;
+	pfd[0].revents = 0;
+	pfd[1].fd = stop_fd;
+	pfd[1].events = POLLIN;
+	pfd[1].revents = 0;
+	num_pfds = 2;
+
+	do {
+		do {
+			ret = poll(pfd, num_pfds, -1);
+		} while (ret == -1 && errno == EINTR);
+
+		if (pfd[0].revents & POLLIN) {
+			uint64_t event;
+			ret = read(pdata->aio_eventfd, &event, sizeof(event));
+			if (ret != sizeof(event)) {
+				ERROR("Failed to read from eventfd: %zd\n", ret);
+				ret = -EIO;
+				break;
+			}
+
+			ret = io_getevents(pdata->aio_ctx, 0, 1, e, NULL);
+			if (ret != 1) {
+				ERROR("Failed to read IO events: %zd\n", ret);
+				ret = -EIO;
+				break;
+			} else {
+				ret = (long)e[0].res;
+			}
+		} else if ((num_pfds > 1 && pfd[1].revents & POLLIN)) {
+			/* Got a STOP event to abort this whole session */
+			ret = io_cancel(pdata->aio_ctx, &iocb, e);
+			if (ret != -EINPROGRESS && ret != -EINVAL) {
+				ERROR("Failed to cancel IO transfer: %zd\n", ret);
+				ret = -EIO;
+				break;
+			}
+			/* It should not be long now until we get the cancellation event */
+			num_pfds = 1;
+		}
+	} while (!(pfd[0].revents & POLLIN));
+
+	/* Got STOP event, treat it as EOF */
+	if (num_pfds == 1)
+		return 0;
+
+	return ret;
+}
+
+static ssize_t readfd_aio(struct parser_pdata *pdata, void *dest, size_t len)
+{
+	return async_io(pdata, dest, len, true);
+}
+
+static ssize_t writefd_aio(struct parser_pdata *pdata, const void *dest,
+	size_t len)
+{
+	return async_io(pdata, (void *)dest, len, false);
+}
+#endif /* WITH_AIO */
+
+static ssize_t readfd_io(struct parser_pdata *pdata, void *dest, size_t len)
+{
+	ssize_t ret;
+	struct pollfd pfd[2];
+
+	pfd[0].fd = pdata->fd_out;
+	pfd[0].events = POLLIN;
+	pfd[0].revents = 0;
+	pfd[1].fd = stop_fd;
+	pfd[1].events = POLLIN;
+	pfd[1].revents = 0;
+
+	do {
+		do {
+			ret = poll(pfd, 2, -1);
+		} while (ret == -1 && errno == EINTR);
+
+		/* Got STOP event, treat it as EOF */
+		if (pfd[1].revents & POLLIN)
+			return 0;
+		if (!(pfd[0].revents & POLLIN))
+			continue;
+
+		do {
+			if (pdata->fd_in_is_socket)
+				ret = recv(pdata->fd_in, dest, len, MSG_NOSIGNAL);
+			else
+				ret = read(pdata->fd_in, dest, len);
+		} while (ret == -1 && errno == EINTR);
+	} while (ret == -1 && errno == EAGAIN);
+
+	if (ret == -1)
+		return -errno;
+
+	return ret;
+}
+
+static ssize_t writefd_io(struct parser_pdata *pdata, const void *src, size_t len)
+{
+	ssize_t ret;
+	struct pollfd pfd[2];
+
+	pfd[0].fd = pdata->fd_out;
+	pfd[0].events = POLLOUT;
+	pfd[0].revents = 0;
+	pfd[1].fd = stop_fd;
+	pfd[1].events = POLLIN;
+	pfd[1].revents = 0;
+
+	do {
+		do {
+			ret = poll(pfd, 2, -1);
+		} while (ret == -1 && errno == EINTR);
+
+		/* Got STOP event, treat as EOF */
+		if (pfd[1].revents & POLLIN)
+			return 0;
+		if (!(pfd[0].revents & POLLOUT))
+			continue;
+
+		do {
+			if (pdata->fd_out_is_socket)
+				ret = send(pdata->fd_out, src, len, MSG_NOSIGNAL);
+			else
+				ret = write(pdata->fd_out, src, len);
+		} while (ret == -1 && errno == EINTR);
+
+	} while (ret == -1 && errno == EAGAIN);
+
+	if (ret == -1)
+		return -errno;
+
+	return ret;
+}
 
 static ssize_t write_all(struct parser_pdata *pdata,
 		const void *src, size_t len)
 {
-	const void *ptr = src;
+	uintptr_t ptr = (uintptr_t) src;
+
 	while (len) {
-		ssize_t ret = writefd(pdata, ptr, len);
+		ssize_t ret = writefd(pdata, (void *) ptr, len);
 		if (ret < 0)
-			return -errno;
+			return ret;
 		if (!ret)
 			return -EPIPE;
 		ptr += ret;
 		len -= ret;
 	}
-	return ptr - src;
+
+	return ptr - (uintptr_t) src;
 }
 
 static ssize_t read_all(struct parser_pdata *pdata,
 		void *dst, size_t len)
 {
-	void *ptr = dst;
+	uintptr_t ptr = (uintptr_t) dst;
+
 	while (len) {
-		ssize_t ret = readfd(pdata, ptr, len);
+		ssize_t ret = readfd(pdata, (void *) ptr, len);
 		if (ret < 0)
-			return -errno;
+			return ret;
 		if (!ret)
 			return -EPIPE;
 		ptr += ret;
 		len -= ret;
 	}
-	return ptr - dst;
+
+	return ptr - (uintptr_t) dst;
 }
 
 static void print_value(struct parser_pdata *pdata, long value)
@@ -251,17 +423,30 @@ static ssize_t receive_data(struct DevEntry *dev, struct ThdEntry *thd)
 	}
 }
 
+static void dev_entry_put(struct DevEntry *entry)
+{
+	bool free_entry = false;
+
+	pthread_mutex_lock(&entry->thdlist_lock);
+	entry->ref_count--;
+	if (entry->ref_count == 0)
+		free_entry = true;
+	pthread_mutex_unlock(&entry->thdlist_lock);
+
+	if (free_entry) {
+		pthread_mutex_destroy(&entry->thdlist_lock);
+
+		free(entry->mask);
+		free(entry);
+	}
+}
+
 static void signal_thread(struct ThdEntry *thd, ssize_t ret)
 {
-
 	thd->err = ret;
 	thd->nb = 0;
 	thd->active = false;
-
-	/* Ensure that the client thread is already waiting */
-	pthread_mutex_lock(&thd->cond_lock);
 	pthread_cond_signal(&thd->cond);
-	pthread_mutex_unlock(&thd->cond_lock);
 }
 
 static void * rw_thd(void *d)
@@ -281,9 +466,7 @@ static void * rw_thd(void *d)
 		     mask_updated = false;
 		unsigned int sample_size;
 
-		/* NOTE: this while loop must exit with
-		 * devlist_lock and thdlist_lock locked. */
-		pthread_mutex_lock(&devlist_lock);
+		/* NOTE: this while loop must exit with thdlist_lock locked. */
 		pthread_mutex_lock(&entry->thdlist_lock);
 
 		if (SLIST_EMPTY(&entry->thdlist_head))
@@ -294,7 +477,7 @@ static void * rw_thd(void *d)
 			unsigned int samples_count = 0;
 
 			memset(entry->mask, 0, nb_words * sizeof(*entry->mask));
-			SLIST_FOREACH(thd, &entry->thdlist_head, next) {
+			SLIST_FOREACH(thd, &entry->thdlist_head, dev_list_entry) {
 				for (i = 0; i < nb_words; i++)
 					entry->mask[i] |= thd->mask[i];
 
@@ -322,11 +505,14 @@ static void * rw_thd(void *d)
 				break;
 			}
 
+			iio_buffer_set_blocking_mode(entry->buf, false);
+			entry->buf_fd = iio_buffer_get_poll_fd(entry->buf);
+
 			/* Signal the threads that we opened the device */
-			SLIST_FOREACH(thd, &entry->thdlist_head, next) {
+			SLIST_FOREACH(thd, &entry->thdlist_head, dev_list_entry) {
 				if (thd->wait_for_open) {
-					signal_thread(thd, 0);
 					thd->wait_for_open = false;
+					signal_thread(thd, 0);
 				}
 			}
 
@@ -342,7 +528,7 @@ static void * rw_thd(void *d)
 
 		sample_size = entry->sample_size;
 
-		SLIST_FOREACH(thd, &entry->thdlist_head, next) {
+		SLIST_FOREACH(thd, &entry->thdlist_head, dev_list_entry) {
 			thd->active = !thd->err && thd->nb >= sample_size;
 			if (mask_updated && thd->active)
 				signal_thread(thd, thd->nb);
@@ -354,7 +540,6 @@ static void * rw_thd(void *d)
 		}
 
 		pthread_mutex_unlock(&entry->thdlist_lock);
-		pthread_mutex_unlock(&devlist_lock);
 
 		if (!has_readers && !had_readers && !has_writers) {
 			struct timespec ts = {
@@ -372,19 +557,30 @@ static void * rw_thd(void *d)
 		 * to be sure that we don't lose samples. */
 		if (has_readers || had_readers) {
 			ssize_t nb_bytes;
+			struct pollfd pfd[2];
 
-			ret = iio_buffer_refill(entry->buf);
+			pfd[0].events = POLLIN;
+			pfd[0].fd = entry->buf_fd;
+			pfd[1].events = POLLIN;
+			pfd[1].fd = stop_fd;
 
-			pthread_mutex_lock(&devlist_lock);
-			pthread_mutex_lock(&entry->thdlist_lock);
+			do {
+				ret = poll(pfd, 2, -1);
+			} while (ret == -1 && errno == EINTR);
 
-			if (ret < 0) {
-				ERROR("Reading from device failed: %i\n",
-						(int) ret);
-				break;
+			if ((pfd[1].revents & POLLIN) == 0) {
+				ret = iio_buffer_refill(entry->buf);
+				if (ret < 0)
+					ERROR("Reading from device failed: %i\n",
+							(int) ret);
+			} else {
+				ret = -EINTR;
 			}
 
-			pthread_mutex_unlock(&devlist_lock);
+			pthread_mutex_lock(&entry->thdlist_lock);
+
+			if (ret < 0)
+				break;
 
 			had_readers = false;
 			nb_bytes = ret;
@@ -395,7 +591,7 @@ static void * rw_thd(void *d)
 			 * reads "thd" to get the address of the next element. */
 			for (thd = SLIST_FIRST(&entry->thdlist_head);
 					thd; thd = next_thd) {
-				next_thd = SLIST_NEXT(thd, next);
+				next_thd = SLIST_NEXT(thd, dev_list_entry);
 
 				if (!thd->active || thd->is_writer)
 					continue;
@@ -415,6 +611,7 @@ static void * rw_thd(void *d)
 
 		if (has_writers) {
 			ssize_t nb_bytes = 0;
+			struct pollfd pfd[2];
 
 			pthread_mutex_lock(&entry->thdlist_lock);
 
@@ -424,7 +621,7 @@ static void * rw_thd(void *d)
 			/* Same comment as above */
 			for (thd = SLIST_FIRST(&entry->thdlist_head);
 					thd; thd = next_thd) {
-				next_thd = SLIST_NEXT(thd, next);
+				next_thd = SLIST_NEXT(thd, dev_list_entry);
 
 				if (!thd->active || !thd->is_writer)
 					continue;
@@ -440,27 +637,32 @@ static void * rw_thd(void *d)
 					signal_thread(thd, ret);
 			}
 
-			ret = iio_buffer_push_partial(entry->buf,
+			pfd[0].events = POLLOUT;
+			pfd[0].fd = entry->buf_fd;
+			pfd[1].events = POLLIN;
+			pfd[1].fd = stop_fd;
+
+			do {
+				ret = poll(pfd, 2, -1);
+			} while (ret == -1 && errno == EINTR);
+
+			if ((pfd[1].revents & POLLIN) == 0) {
+				ret = iio_buffer_push_partial(entry->buf,
 					nb_bytes / sample_size);
-
-			if (ret < 0) {
-				ERROR("Writing to device failed: %i\n",
-						(int) ret);
-
-				/* We have to exit the loop with both mutexes
-				 * locked. thdlist_lock is already locked, but
-				 * it must be unlocked before we can lock
-				 * devlist_lock, to avoid deadlocks. */
-				pthread_mutex_unlock(&entry->thdlist_lock);
-				pthread_mutex_lock(&devlist_lock);
-				pthread_mutex_lock(&entry->thdlist_lock);
-				break;
+				if (ret < 0)
+					ERROR("Writing to device failed: %i\n",
+							(int) ret);
+			} else {
+				ret = -EINTR;
 			}
+
+			if (ret < 0)
+				break;
 
 			/* Signal threads which completed their RW command */
 			for (thd = SLIST_FIRST(&entry->thdlist_head);
 					thd; thd = next_thd) {
-				next_thd = SLIST_NEXT(thd, next);
+				next_thd = SLIST_NEXT(thd, dev_list_entry);
 				if (thd->active && thd->is_writer &&
 						thd->nb < sample_size)
 					signal_thread(thd, thd->nb);
@@ -472,87 +674,72 @@ static void * rw_thd(void *d)
 
 	/* Signal all remaining threads */
 	for (thd = SLIST_FIRST(&entry->thdlist_head); thd; thd = next_thd) {
-		next_thd = SLIST_NEXT(thd, next);
-		SLIST_REMOVE(&entry->thdlist_head, thd, ThdEntry, next);
+		next_thd = SLIST_NEXT(thd, dev_list_entry);
+		SLIST_REMOVE(&entry->thdlist_head, thd, ThdEntry, dev_list_entry);
+		thd->wait_for_open = false;
 		signal_thread(thd, ret);
 	}
+	if (entry->buf)
+		iio_buffer_destroy(entry->buf);
+	entry->closed = true;
 	pthread_mutex_unlock(&entry->thdlist_lock);
+
+	pthread_mutex_lock(&devlist_lock);
+	/* It is possible that a new thread has already started, make sure to
+	 * not overwrite it. */
+	if (iio_device_get_data(dev) == entry)
+		iio_device_set_data(dev, NULL);
+	pthread_mutex_unlock(&devlist_lock);
 
 	DEBUG("Stopping R/W thread for device %s\n",
 			dev->name ? dev->name : dev->id);
-	SLIST_REMOVE(&devlist_head, entry, DevEntry, next);
 
-	if (entry->buf)
-		iio_buffer_destroy(entry->buf);
-	pthread_mutex_unlock(&devlist_lock);
+	dev_entry_put(entry);
+	thread_stopped();
 
-	if (ret >= 0) {
-		/* Signal the last client that the device has been closed */
-		pthread_mutex_lock(&entry->last_lock);
-		pthread_cond_signal(&entry->last_cond);
+	return NULL;
+}
 
-		/* And wait for the last client to give us back the lock,
-		 * so that we can destroy it... */
-		pthread_cond_wait(&entry->last_cond, &entry->last_lock);
-		pthread_mutex_unlock(&entry->last_lock);
+static struct ThdEntry *parser_lookup_thd_entry(struct parser_pdata *pdata,
+	struct iio_device *dev)
+{
+	struct ThdEntry *t;
+
+	SLIST_FOREACH(t, &pdata->thdlist_head, parser_list_entry) {
+		if (t->dev == dev)
+			return t;
 	}
 
-	pthread_mutex_destroy(&entry->last_lock);
-	pthread_cond_destroy(&entry->last_cond);
-	pthread_mutex_destroy(&entry->thdlist_lock);
-	pthread_attr_destroy(&entry->attr);
-
-	free(entry->mask);
-	free(entry);
 	return NULL;
 }
 
 static ssize_t rw_buffer(struct parser_pdata *pdata,
 		struct iio_device *dev, unsigned int nb, bool is_write)
 {
-	struct DevEntry *e, *entry = NULL;
-	struct ThdEntry *t, *thd = NULL;
+	struct DevEntry *entry;
+	struct ThdEntry *thd;
 	ssize_t ret;
 
 	if (!dev)
 		return -ENODEV;
 
-	pthread_mutex_lock(&devlist_lock);
+	thd = parser_lookup_thd_entry(pdata, dev);
+	if (!thd)
+		return -EBADF;
 
-	SLIST_FOREACH(e, &devlist_head, next) {
-		if (e->dev == dev) {
-			entry = e;
-			break;
-		}
-	}
+	entry = thd->entry;
 
-	if (!entry) {
-		pthread_mutex_unlock(&devlist_lock);
-		return -ENXIO;
-	}
-
-	if (nb < entry->sample_size) {
-		pthread_mutex_unlock(&devlist_lock);
+	if (nb < entry->sample_size)
 		return 0;
-	}
 
 	pthread_mutex_lock(&entry->thdlist_lock);
-	SLIST_FOREACH(t, &entry->thdlist_head, next) {
-		if (t->pdata == pdata) {
-			thd = t;
-			break;
-		}
-	}
-
-	if (!thd) {
+	if (entry->closed) {
 		pthread_mutex_unlock(&entry->thdlist_lock);
-		pthread_mutex_unlock(&devlist_lock);
-		return -ENXIO;
+		return -EBADF;
 	}
 
 	if (thd->nb) {
 		pthread_mutex_unlock(&entry->thdlist_lock);
-		pthread_mutex_unlock(&devlist_lock);
 		return -EBUSY;
 	}
 
@@ -562,13 +749,11 @@ static ssize_t rw_buffer(struct parser_pdata *pdata,
 	thd->is_writer = is_write;
 	thd->active = true;
 
-	pthread_mutex_unlock(&entry->thdlist_lock);
-	pthread_mutex_unlock(&devlist_lock);
-
 	DEBUG("Waiting for completion...\n");
-	pthread_cond_wait(&thd->cond, &thd->cond_lock);
+	while (thd->active)
+		pthread_cond_wait(&thd->cond, &entry->thdlist_lock);
 	ret = thd->err;
-	pthread_mutex_unlock(&thd->cond_lock);
+	pthread_mutex_unlock(&entry->thdlist_lock);
 
 	if (ret > 0 && ret < nb)
 		print_value(thd->pdata, 0);
@@ -601,15 +786,39 @@ static uint32_t *get_mask(const char *mask, size_t *len)
 	return words;
 }
 
+static void free_thd_entry(struct ThdEntry *t)
+{
+	pthread_cond_destroy(&t->cond);
+	free(t->mask);
+	free(t);
+}
+
+static void remove_thd_entry(struct ThdEntry *t)
+{
+	struct DevEntry *entry = t->entry;
+
+	pthread_mutex_lock(&entry->thdlist_lock);
+	if (!entry->closed) {
+		entry->update_mask = true;
+		SLIST_REMOVE(&entry->thdlist_head, t, ThdEntry, dev_list_entry);
+	}
+	pthread_mutex_unlock(&entry->thdlist_lock);
+	dev_entry_put(entry);
+
+	free_thd_entry(t);
+}
+
 static int open_dev_helper(struct parser_pdata *pdata, struct iio_device *dev,
 		size_t samples_count, const char *mask, bool cyclic)
 {
+	pthread_attr_t attr;
 	int ret = -ENOMEM;
-	struct DevEntry *e, *entry = NULL;
+	struct DevEntry *entry;
 	struct ThdEntry *thd;
 	size_t len = strlen(mask);
 	uint32_t *words;
 	unsigned int nb_channels;
+	sigset_t sigmask, oldsigmask;
 
 	if (!dev)
 		return -ENODEV;
@@ -622,21 +831,7 @@ static int open_dev_helper(struct parser_pdata *pdata, struct iio_device *dev,
 	if (!words)
 		return -ENOMEM;
 
-	pthread_mutex_lock(&devlist_lock);
-	SLIST_FOREACH(e, &devlist_head, next) {
-		if (e->dev == dev) {
-			entry = e;
-			break;
-		}
-	}
-
-	if (entry && (cyclic || entry->cyclic)) {
-		/* Only one client allowed in cyclic mode */
-		ret = -EBUSY;
-		goto err_free_words;
-	}
-
-	thd = malloc(sizeof(*thd));
+	thd = zalloc(sizeof(*thd));
 	if (!thd)
 		goto err_free_words;
 
@@ -646,32 +841,61 @@ static int open_dev_helper(struct parser_pdata *pdata, struct iio_device *dev,
 	thd->samples_count = samples_count;
 	thd->sample_size = iio_device_get_sample_size_mask(dev, words, len);
 	thd->pdata = pdata;
+	thd->dev = dev;
 	pthread_cond_init(&thd->cond, NULL);
-	pthread_mutex_init(&thd->cond_lock, NULL);
-	pthread_mutex_lock(&thd->cond_lock);
 
+	/* Atomically look up the thread and make sure that it is still active
+	 * or allocate new one. */
+	pthread_mutex_lock(&devlist_lock);
+	entry = iio_device_get_data(dev);
 	if (entry) {
 		pthread_mutex_lock(&entry->thdlist_lock);
-		SLIST_INSERT_HEAD(&entry->thdlist_head, thd, next);
-		entry->update_mask = true;
-		pthread_mutex_unlock(&entry->thdlist_lock);
-		DEBUG("Added thread to client list\n");
+		if (!entry->closed) {
+			pthread_mutex_unlock(&devlist_lock);
 
-		pthread_mutex_unlock(&devlist_lock);
+			if (cyclic || entry->cyclic) {
+				pthread_mutex_unlock(&entry->thdlist_lock);
+				/* Only one client allowed in cyclic mode */
+				ret = -EBUSY;
+				goto err_free_thd;
+			}
 
-		/* Wait until the device is opened by the rw thread */
-		pthread_cond_wait(&thd->cond, &thd->cond_lock);
-		pthread_mutex_unlock(&thd->cond_lock);
-		return (int) thd->err;
+			entry->ref_count++;
+
+			SLIST_INSERT_HEAD(&entry->thdlist_head, thd, dev_list_entry);
+			thd->entry = entry;
+			entry->update_mask = true;
+			DEBUG("Added thread to client list\n");
+
+			/* Wait until the device is opened by the rw thread */
+			while (thd->wait_for_open)
+				pthread_cond_wait(&thd->cond, &entry->thdlist_lock);
+			pthread_mutex_unlock(&entry->thdlist_lock);
+
+			ret = (int) thd->err;
+			if (ret < 0)
+				remove_thd_entry(thd);
+			else
+				SLIST_INSERT_HEAD(&pdata->thdlist_head, thd, parser_list_entry);
+			return ret;
+		} else {
+			pthread_mutex_unlock(&entry->thdlist_lock);
+		}
 	}
 
-	entry = malloc(sizeof(*entry));
-	if (!entry)
+	entry = zalloc(sizeof(*entry));
+	if (!entry) {
+		pthread_mutex_unlock(&devlist_lock);
 		goto err_free_thd;
+	}
+
+	entry->ref_count = 2; /* One for thread, one for the client */
 
 	entry->mask = malloc(len * sizeof(*words));
-	if (!entry->mask)
+	if (!entry->mask) {
+		pthread_mutex_unlock(&devlist_lock);
 		goto err_free_entry;
+	}
 
 	entry->cyclic = cyclic;
 	entry->nb_words = len;
@@ -679,98 +903,70 @@ static int open_dev_helper(struct parser_pdata *pdata, struct iio_device *dev,
 	entry->dev = dev;
 	entry->buf = NULL;
 	SLIST_INIT(&entry->thdlist_head);
-	SLIST_INSERT_HEAD(&entry->thdlist_head, thd, next);
+	SLIST_INSERT_HEAD(&entry->thdlist_head, thd, dev_list_entry);
+	thd->entry = entry;
 	DEBUG("Added thread to client list\n");
 
-	pthread_cond_init(&entry->last_cond, NULL);
-	pthread_mutex_init(&entry->last_lock, NULL);
 	pthread_mutex_init(&entry->thdlist_lock, NULL);
-	pthread_attr_init(&entry->attr);
-	pthread_attr_setdetachstate(&entry->attr,
-			PTHREAD_CREATE_DETACHED);
+	pthread_attr_init(&attr);
+	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-	ret = pthread_create(&entry->thd, &entry->attr, rw_thd, entry);
-	if (ret)
+	sigfillset(&sigmask);
+	pthread_sigmask(SIG_BLOCK, &sigmask, &oldsigmask);
+	thread_started();
+	ret = pthread_create(&entry->thd, &attr, rw_thd, entry);
+	pthread_sigmask(SIG_SETMASK, &oldsigmask, NULL);
+	pthread_attr_destroy(&attr);
+	if (ret) {
+		pthread_mutex_unlock(&devlist_lock);
+		thread_stopped();
 		goto err_free_entry_mask;
+	}
 
 	DEBUG("Adding new device thread to device list\n");
-	SLIST_INSERT_HEAD(&devlist_head, entry, next);
+	iio_device_set_data(dev, entry);
 	pthread_mutex_unlock(&devlist_lock);
 
+	pthread_mutex_lock(&entry->thdlist_lock);
 	/* Wait until the device is opened by the rw thread */
-	pthread_cond_wait(&thd->cond, &thd->cond_lock);
-	pthread_mutex_unlock(&thd->cond_lock);
-	return (int) thd->err;
+	while (thd->wait_for_open)
+		pthread_cond_wait(&thd->cond, &entry->thdlist_lock);
+	pthread_mutex_unlock(&entry->thdlist_lock);
+
+	ret = (int) thd->err;
+	if (ret < 0)
+		remove_thd_entry(thd);
+	else
+		SLIST_INSERT_HEAD(&pdata->thdlist_head, thd, parser_list_entry);
+	return ret;
 
 err_free_entry_mask:
 	free(entry->mask);
 err_free_entry:
 	free(entry);
 err_free_thd:
+	pthread_cond_destroy(&thd->cond);
 	free(thd);
 err_free_words:
 	free(words);
-	pthread_mutex_unlock(&devlist_lock);
 	return ret;
 }
 
 static int close_dev_helper(struct parser_pdata *pdata, struct iio_device *dev)
 {
-	struct DevEntry *e;
+	struct ThdEntry *t;
 
 	if (!dev)
 		return -ENODEV;
 
-	pthread_mutex_lock(&devlist_lock);
-	SLIST_FOREACH(e, &devlist_head, next) {
-		if (e->dev == dev) {
-			struct ThdEntry *t;
-			pthread_mutex_lock(&e->thdlist_lock);
-			SLIST_FOREACH(t, &e->thdlist_head, next) {
-				if (t->pdata == pdata) {
-					bool last;
-					pthread_mutex_t *last_lock =
-						&e->last_lock;
-					pthread_cond_t *last_cond =
-						&e->last_cond;
+	t = parser_lookup_thd_entry(pdata, dev);
+	if (!t)
+		return -ENXIO;
 
-					e->update_mask = true;
-					SLIST_REMOVE(&e->thdlist_head,
-							t, ThdEntry, next);
-					last = SLIST_EMPTY(&e->thdlist_head);
-					free(t->mask);
-					free(t);
+	SLIST_REMOVE(&pdata->thdlist_head, t, ThdEntry, parser_list_entry);
+	remove_thd_entry(t);
 
-					if (last)
-						pthread_mutex_lock(last_lock);
-					pthread_mutex_unlock(&e->thdlist_lock);
-					pthread_mutex_unlock(&devlist_lock);
-
-					/* If we are the last client for this
-					 * device, we wait until the R/W thread
-					 * closes it. Otherwise, the CLOSE
-					 * command is returned too soon, which
-					 * might cause problems if the client
-					 * sends a command which requires the
-					 * device to be closed. */
-					if (last) {
-						pthread_cond_wait(last_cond,
-								last_lock);
-						pthread_cond_signal(last_cond);
-						pthread_mutex_unlock(last_lock);
-					}
-					return 0;
-				}
-			}
-
-			pthread_mutex_unlock(&e->thdlist_lock);
-			pthread_mutex_unlock(&devlist_lock);
-			return -ENXIO;
-		}
-	}
-
-	pthread_mutex_unlock(&devlist_lock);
-	return -EBADF;
+	return 0;
 }
 
 int open_dev(struct parser_pdata *pdata, struct iio_device *dev,
@@ -971,42 +1167,54 @@ ssize_t read_line(struct parser_pdata *pdata, char *buf, size_t len)
 	ssize_t ret;
 
 	if (pdata->fd_in_is_socket) {
+		struct pollfd pfd[2];
+
+		pfd[0].fd = pdata->fd_in;
+		pfd[0].events = POLLIN;
+		pfd[0].revents = 0;
+		pfd[1].fd = stop_fd;
+		pfd[1].events = POLLIN;
+		pfd[1].revents = 0;
+
+		do {
+			ret = poll(pfd, 2, -1);
+		} while (ret == -1 && errno == EINTR);
+
+		if (pfd[1].revents & POLLIN)
+			return 0;
+
 		/* First read from the socket, without advancing the
 		 * read offset */
 		ret = recv(pdata->fd_in, buf, len, MSG_NOSIGNAL | MSG_PEEK);
-		if (ret < 0) {
-			if (errno == ENOTSOCK)
-				pdata->fd_in_is_socket = false;
-		} else {
+		if (ret > 0) {
 			size_t i;
 
 			/* Lookup for the trailing \n */
 			for (i = 0; i < (size_t) ret && buf[i] != '\n'; i++);
 
 			/* No \n found? Just garbage data */
-			if (i == (size_t) ret) {
-				errno = EIO;
-				return -1;
-			}
+			if (i == (size_t) ret)
+				return -EIO;
 
 			/* Advance the read offset to the byte following
 			 * the \n */
 			ret = recv(pdata->fd_in, buf, i + 1,
 					MSG_NOSIGNAL | MSG_TRUNC);
 		}
+	} else {
+		ret = readfd(pdata, buf, len);
 	}
-
-	if (!pdata->fd_in_is_socket)
-		ret = read(pdata->fd_in, buf, len);
 
 	return ret;
 }
 
-void interpreter(struct iio_context *ctx, int fd_in, int fd_out, bool verbose)
+void interpreter(struct iio_context *ctx, int fd_in, int fd_out, bool verbose,
+	bool is_socket, bool use_aio)
 {
 	yyscan_t scanner;
 	struct parser_pdata pdata;
 	unsigned int i;
+	int ret;
 
 	pdata.ctx = ctx;
 	pdata.stop = false;
@@ -1014,23 +1222,56 @@ void interpreter(struct iio_context *ctx, int fd_in, int fd_out, bool verbose)
 	pdata.fd_out = fd_out;
 	pdata.verbose = verbose;
 
-	/* Consider that the input/output FDs are sockets by default.
-	 * Then, if we get an error with errno == ENOTSOCK, we know that we have
-	 * to use regular I/O calls. */
-	pdata.fd_in_is_socket = true;
-	pdata.fd_out_is_socket = true;
+	pdata.fd_in_is_socket = is_socket;
+	pdata.fd_out_is_socket = is_socket;
+
+	SLIST_INIT(&pdata.thdlist_head);
+
+	if (use_aio) {
+		/* Note: if WITH_AIO is not defined, use_aio is always false.
+		 * We ensure that in iiod.c. */
+#if WITH_AIO
+		char err_str[1024];
+
+		pdata.aio_eventfd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+		if (pdata.aio_eventfd < 0) {
+			iio_strerror(errno, err_str, sizeof(err_str));
+			ERROR("Failed to create AIO eventfd: %s\n", err_str);
+			return;
+		}
+		ret = io_setup(1, &pdata.aio_ctx);
+		if (ret < 0) {
+			iio_strerror(ret, err_str, sizeof(err_str));
+			ERROR("Failed to create AIO eventfd: %s\n", err_str);
+			close(pdata.aio_eventfd);
+			return;
+		}
+		pdata.readfd = readfd_aio;
+		pdata.writefd = writefd_aio;
+#endif
+	} else {
+		pdata.readfd = readfd_io;
+		pdata.writefd = writefd_io;
+	}
 
 	yylex_init_extra(&pdata, &scanner);
 
 	do {
 		if (verbose)
 			output(&pdata, "iio-daemon > ");
-		yyparse(scanner);
-	} while (!pdata.stop);
+		ret = yyparse(scanner);
+	} while (!pdata.stop && ret >= 0);
 
 	yylex_destroy(scanner);
 
 	/* Close all opened devices */
 	for (i = 0; i < ctx->nb_devices; i++)
 		close_dev_helper(&pdata, ctx->devices[i]);
+
+#if WITH_AIO
+	if (use_aio) {
+		io_destroy(pdata.aio_ctx);
+		close(pdata.aio_eventfd);
+	}
+#endif
 }

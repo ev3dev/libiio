@@ -1,3 +1,11 @@
+libiio (0.6.187-1) unstable; urgency=medium
+
+  * update to v0.6-187-g5d107e9
+  * put iiod in Section: net (Closes: #814703)
+  * libiio0-cil arch any (not all) (Closes: #816981)
+
+ -- A. Maitland Bottoms <bottoms@debian.org>  Thu, 28 Apr 2016 00:48:43 -0400
+
 libiio (0.6.40-1) unstable; urgency=medium
 
   * Initial upload to Debian (closes: #814032)

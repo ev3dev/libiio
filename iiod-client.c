@@ -16,7 +16,6 @@ struct iiod_client {
 static ssize_t iiod_client_read_integer(struct iiod_client *client,
 		int desc, int *val)
 {
-	const struct iiod_client_ops *ops = client->ops;
 	unsigned int i;
 	char buf[1024], *ptr = NULL, *end;
 	ssize_t ret;
@@ -155,7 +154,7 @@ int iiod_client_get_version(struct iiod_client *client, int desc,
 		return ret;
 	}
 
-	ret = ops->read(pdata, desc, buf, sizeof(buf));
+	ret = ops->read_line(pdata, desc, buf, sizeof(buf));
 	iio_mutex_unlock(client->lock);
 
 	if (ret < 0)
@@ -189,7 +188,6 @@ int iiod_client_get_version(struct iiod_client *client, int desc,
 int iiod_client_get_trigger(struct iiod_client *client, int desc,
 		const struct iio_device *dev, const struct iio_device **trigger)
 {
-	struct iio_context_pdata *pdata = client->pdata;
 	const struct iio_context *ctx = iio_device_get_context(dev);
 	unsigned int i, nb_devices = iio_context_get_devices_count(ctx);
 	char buf[1024];
@@ -244,7 +242,6 @@ out_unlock:
 int iiod_client_set_trigger(struct iiod_client *client, int desc,
 		const struct iio_device *dev, const struct iio_device *trigger)
 {
-	const struct iiod_client_ops *ops = client->ops;
 	char buf[1024];
 	int ret;
 
@@ -295,8 +292,6 @@ ssize_t iiod_client_read_attr(struct iiod_client *client, int desc,
 		const struct iio_device *dev, const struct iio_channel *chn,
 		const char *attr, char *dest, size_t len, bool is_debug)
 {
-	struct iio_context_pdata *pdata = client->pdata;
-	const struct iiod_client_ops *ops = client->ops;
 	const char *id = iio_device_get_id(dev);
 	char buf[1024];
 	ssize_t ret;
@@ -413,7 +408,7 @@ struct iio_context * iiod_client_create_context(
 {
 	struct iio_context *ctx = NULL;
 	size_t xml_len;
-	char *xml, c;
+	char *xml;
 	int ret;
 
 	iio_mutex_lock(client->lock);
@@ -422,18 +417,16 @@ struct iio_context * iiod_client_create_context(
 		goto out_unlock;
 
 	xml_len = (size_t) ret;
-	xml = malloc(xml_len);
+	xml = malloc(xml_len + 1);
 	if (!xml) {
 		ret = -ENOMEM;
 		goto out_unlock;
 	}
 
-	ret = (int) iiod_client_read_all(client, desc, xml, xml_len);
+	/* +1: Also read the trailing \n */
+	ret = (int) iiod_client_read_all(client, desc, xml, xml_len + 1);
 	if (ret < 0)
 		goto out_free_xml;
-
-	/* Discard \n character */
-	client->ops->read(client->pdata, desc, &c, 1);
 
 	ctx = iio_create_xml_context_mem(xml, xml_len);
 	if (!ctx)
@@ -492,11 +485,14 @@ static int iiod_client_read_mask(struct iiod_client *client,
 	else
 		ret = 0;
 
+	buf[words*8] = '\0';
+
 	DEBUG("Reading mask\n");
 
 	for (i = words, ptr = buf; i > 0; i--) {
 		sscanf(ptr, "%08x", &mask[i - 1]);
-		DEBUG("mask[%i] = 0x%08x\n", i - 1, mask[i - 1]);
+		DEBUG("mask[%lu] = 0x%08x\n",
+				(unsigned long)(i - 1), mask[i - 1]);
 
 		ptr = (char *) ((uintptr_t) ptr + 8);
 	}
@@ -512,7 +508,6 @@ ssize_t iiod_client_read_unlocked(struct iiod_client *client, int desc,
 {
 	unsigned int nb_channels = iio_device_get_channels_count(dev);
 	uintptr_t ptr = (uintptr_t) dst;
-	struct iio_device_pdata *pdata = dev->pdata;
 	char buf[1024];
 	ssize_t ret, read = 0;
 
@@ -532,6 +527,8 @@ ssize_t iiod_client_read_unlocked(struct iiod_client *client, int desc,
 		ret = iiod_client_read_integer(client, desc, &to_read);
 		if (ret < 0)
 			return ret;
+		if (to_read < 0)
+			return (ssize_t) to_read;
 		if (!to_read)
 			break;
 
@@ -558,7 +555,6 @@ ssize_t iiod_client_read_unlocked(struct iiod_client *client, int desc,
 ssize_t iiod_client_write_unlocked(struct iiod_client *client, int desc,
 		const struct iio_device *dev, const void *src, size_t len)
 {
-	struct iio_device_pdata *pdata = dev->pdata;
 	ssize_t ret;
 	char buf[1024];
 	int val;

@@ -29,14 +29,14 @@ enum backend {
 	LOCAL,
 	XML,
 	NETWORK,
-	USB,
+	AUTO,
 };
 
 static const struct option options[] = {
 	  {"help", no_argument, 0, 'h'},
 	  {"xml", required_argument, 0, 'x'},
 	  {"network", required_argument, 0, 'n'},
-	  {"usb", required_argument, 0, 'u'},
+	  {"uri", required_argument, 0, 'u'},
 	  {0, 0, 0, 0},
 };
 
@@ -44,7 +44,7 @@ static const char *options_descriptions[] = {
 	"Show this help and quit.",
 	"Use the XML backend with the provided XML file.",
 	"Use the network backend with the provided hostname.",
-	"Use the USB backend with the device that matches the given VID/PID.",
+	"Use the context at the provided URI.",
 };
 
 static void usage(void)
@@ -53,7 +53,7 @@ static void usage(void)
 
 	printf("Usage:\n\t" MY_NAME " [-x <xml_file>]\n\t"
 			MY_NAME " [-n <hostname>]\n\t"
-			MY_NAME " [-u <vid>:<pid>]\n\nOptions:\n");
+			MY_NAME " [-u <uri>]\n\nOptions:\n");
 	for (i = 0; options[i].name; i++)
 		printf("\t-%c, --%s\n\t\t\t%s\n",
 					options[i].val, options[i].name,
@@ -64,7 +64,7 @@ int main(int argc, char **argv)
 {
 	struct iio_context *ctx;
 	int c, option_index = 0, arg_index = 0, xml_index = 0, ip_index = 0,
-	    device_index = 0;
+	    uri_index = 0;
 	enum backend backend = LOCAL;
 	unsigned int major, minor;
 	char git_tag[8];
@@ -99,9 +99,9 @@ int main(int argc, char **argv)
 				fprintf(stderr, "-x, -n and -u are mutually exclusive\n");
 				return EXIT_FAILURE;
 			}
-			backend = USB;
+			backend = AUTO;
 			arg_index += 2;
-			device_index = arg_index;
+			uri_index = arg_index;
 			break;
 		case '?':
 			return EXIT_FAILURE;
@@ -117,32 +117,14 @@ int main(int argc, char **argv)
 	iio_library_get_version(&major, &minor, git_tag);
 	printf("Library version: %u.%u (git tag: %s)\n", major, minor, git_tag);
 
-	if (backend == XML) {
+	if (backend == XML)
 		ctx = iio_create_xml_context(argv[xml_index]);
-	} else if (backend == NETWORK) {
+	else if (backend == NETWORK)
 		ctx = iio_create_network_context(argv[ip_index]);
-	} else if (backend == USB) {
-		char *ptr = argv[device_index], *end;
-		long vid, pid;
-
-		vid = strtol(ptr, &end, 0);
-		if (ptr == end || *end != ':') {
-			fprintf(stderr, "Invalid VID/PID\n");
-			return EXIT_FAILURE;
-		}
-
-		ptr = end + 1;
-		pid = strtol(ptr, &end, 0);
-		if (ptr == end) {
-			fprintf(stderr, "Invalid VID/PID\n");
-			return EXIT_FAILURE;
-		}
-
-		ctx = iio_create_usb_context(
-				(unsigned short) vid, (unsigned short) pid);
-	} else {
+	else if (backend == AUTO)
+		ctx = iio_create_context_from_uri(argv[uri_index]);
+	else
 		ctx = iio_create_default_context();
-	}
 
 	if (!ctx) {
 		fprintf(stderr, "Unable to create IIO context\n");
@@ -201,17 +183,20 @@ int main(int argc, char **argv)
 				const char *attr = iio_channel_get_attr(ch, k);
 				char buf[1024];
 				ret = (int) iio_channel_attr_read(ch,
-						attr, buf, 1024);
-				if (ret > 0)
+						attr, buf, sizeof(buf));
+				if (ret > 0) {
 					printf("\t\t\t\tattr %u: %s"
 							" value: %s\n", k,
 							attr, buf);
-				else if (ret == -ENOSYS)
+				} else if (ret == -ENOSYS) {
 					printf("\t\t\t\tattr %u: %s\n",
 							k, attr);
-				else
-					fprintf(stderr, "Unable to read attribute %s\n",
-							attr);
+				} else {
+					iio_strerror(-ret, buf, sizeof(buf));
+
+					fprintf(stderr, "Unable to read attribute %s: %s\n",
+							attr, buf);
+				}
 			}
 		}
 
@@ -224,15 +209,37 @@ int main(int argc, char **argv)
 			const char *attr = iio_device_get_attr(dev, j);
 			char buf[1024];
 			ret = (int) iio_device_attr_read(dev,
-					attr, buf, 1024);
-			if (ret > 0)
+					attr, buf, sizeof(buf));
+			if (ret > 0) {
 				printf("\t\t\t\tattr %u: %s value: %s\n", j,
 						attr, buf);
-			else if (ret == -ENOSYS)
+			} else if (ret == -ENOSYS) {
 				printf("\t\t\t\tattr %u: %s\n", j, attr);
-			else
-				fprintf(stderr, "Unable to read attribute:"
-						" %s\n", attr);
+			} else {
+				iio_strerror(-ret, buf, sizeof(buf));
+
+				fprintf(stderr, "Unable to read attribute %s: %s\n",
+						attr, buf);
+			}
+		}
+
+		nb_attrs = iio_device_get_debug_attrs_count(dev);
+		if (nb_attrs) {
+			printf("\t\t%u debug attributes found:\n", nb_attrs);
+			for (j = 0; j < nb_attrs; j++) {
+				const char *attr =
+					iio_device_get_debug_attr(dev, j);
+				char buf[1024];
+
+				ret = (int) iio_device_debug_attr_read(dev,
+						attr, buf, sizeof(buf));
+				if (ret > 0)
+					printf("\t\t\t\tdebug attr %u: %s value: %s\n",
+							j, attr, buf);
+				else if (ret == -ENOSYS)
+					printf("\t\t\t\tdebug attr %u: %s\n", j,
+							attr);
+			}
 		}
 
 		const struct iio_device *trig;
