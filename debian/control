@@ -85,7 +85,7 @@ Description: CLI bindings for libiio
 Package: libiio-cil-dev
 Section: cli-mono
 Architecture: all
-Depends: libiio0-cil (= ${binary:Version}), ${misc:Depends}
+Depends: libiio0-cil (>= ${source:Version}), ${misc:Depends}
 Description: CLI bindings for libiio (development)
  Libiio is a library that has been conceived to ease the development of
  applications interfacing Industrial Input/Output (IIO) devices through

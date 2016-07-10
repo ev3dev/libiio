@@ -89,43 +89,6 @@ static inline void *zalloc(size_t size)
 	return calloc(1, size);
 }
 
-enum iio_modifier {
-	IIO_NO_MOD,
-	IIO_MOD_X,
-	IIO_MOD_Y,
-	IIO_MOD_Z,
-	IIO_MOD_X_AND_Y,
-	IIO_MOD_X_AND_Z,
-	IIO_MOD_Y_AND_Z,
-	IIO_MOD_X_AND_Y_AND_Z,
-	IIO_MOD_X_OR_Y,
-	IIO_MOD_X_OR_Z,
-	IIO_MOD_Y_OR_Z,
-	IIO_MOD_X_OR_Y_OR_Z,
-	IIO_MOD_LIGHT_BOTH,
-	IIO_MOD_LIGHT_IR,
-	IIO_MOD_ROOT_SUM_SQUARED_X_Y,
-	IIO_MOD_SUM_SQUARED_X_Y_Z,
-	IIO_MOD_LIGHT_CLEAR,
-	IIO_MOD_LIGHT_RED,
-	IIO_MOD_LIGHT_GREEN,
-	IIO_MOD_LIGHT_BLUE,
-	IIO_MOD_QUATERNION,
-	IIO_MOD_TEMP_AMBIENT,
-	IIO_MOD_TEMP_OBJECT,
-	IIO_MOD_NORTH_MAGN,
-	IIO_MOD_NORTH_TRUE,
-	IIO_MOD_NORTH_MAGN_TILT_COMP,
-	IIO_MOD_NORTH_TRUE_TILT_COMP,
-	IIO_MOD_RUNNING,
-	IIO_MOD_JOGGING,
-	IIO_MOD_WALKING,
-	IIO_MOD_STILL,
-	IIO_MOD_ROOT_SUM_SQUARED_X_Y_Z,
-	IIO_MOD_I,
-	IIO_MOD_Q,
-};
-
 struct iio_backend_ops {
 	struct iio_context * (*clone)(const struct iio_context *ctx);
 	ssize_t (*read)(const struct iio_device *dev, void *dst, size_t len,
@@ -137,6 +100,8 @@ struct iio_backend_ops {
 	int (*close)(const struct iio_device *dev);
 	int (*get_fd)(const struct iio_device *dev);
 	int (*set_blocking_mode)(const struct iio_device *dev, bool blocking);
+
+	void (*cancel)(const struct iio_device *dev);
 
 	int (*set_kernel_buffers_count)(const struct iio_device *dev,
 			unsigned int nb_blocks);
@@ -170,6 +135,7 @@ struct iio_backend_ops {
 struct iio_context_pdata;
 struct iio_device_pdata;
 struct iio_channel_pdata;
+struct iio_scan_backend_context;
 
 struct iio_channel_attr {
 	char *name;
@@ -198,6 +164,8 @@ struct iio_channel {
 	struct iio_data_format format;
 	char *name, *id;
 	long index;
+	enum iio_modifier modifier;
+	enum iio_chan_type type;
 
 	struct iio_channel_attr *attrs;
 	unsigned int nb_attrs;
@@ -234,6 +202,19 @@ struct iio_buffer {
 	bool is_output, dev_is_high_speed;
 };
 
+struct iio_context_info {
+	char *description;
+	char *uri;
+};
+
+struct iio_scan_result {
+	size_t size;
+	struct iio_context_info **info;
+};
+
+struct iio_context_info ** iio_scan_result_add(
+	struct iio_scan_result *scan_result, size_t num);
+
 void free_channel(struct iio_channel *chn);
 void free_device(struct iio_device *dev);
 
@@ -256,7 +237,9 @@ int iio_device_get_poll_fd(const struct iio_device *dev);
 
 int read_double(const char *str, double *val);
 int write_double(char *buf, size_t len, double val);
+#ifndef _WIN32
 int set_blocking_mode(int fd, bool blocking);
+#endif
 
 struct iio_context * local_create_context(void);
 struct iio_context * network_create_context(const char *hostname);
@@ -267,9 +250,20 @@ struct iio_context * usb_create_context(unsigned int bus, unsigned int address,
 struct iio_context * usb_create_context_from_uri(const char *uri);
 struct iio_context * serial_create_context_from_uri(const char *uri);
 
+int local_context_scan(struct iio_scan_result *scan_result);
+
+struct iio_scan_backend_context * usb_context_scan_init(void);
+void usb_context_scan_free(struct iio_scan_backend_context *ctx);
+
+int usb_context_scan(struct iio_scan_backend_context *ctx,
+		struct iio_scan_result *scan_result);
+
 /* This function is not part of the API, but is used by the IIO daemon */
 __api ssize_t iio_device_get_sample_size_mask(const struct iio_device *dev,
 		const uint32_t *mask, size_t words);
+
+void iio_channel_init_finalize(struct iio_channel *chn);
+unsigned int find_channel_modifier(const char *s, size_t *len_p);
 
 #undef __api
 

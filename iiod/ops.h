@@ -20,13 +20,14 @@
 #define __OPS_H__
 
 #include "../iio.h"
+#include "queue.h"
 
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/socket.h>
-#include <sys/queue.h>
 #include <unistd.h>
 
 #if WITH_AIO
@@ -106,6 +107,17 @@ static __inline__ ssize_t readfd(struct parser_pdata *pdata,
 		void *buf, size_t len)
 {
 	return pdata->readfd(pdata, buf, len);
+}
+
+static __inline__ int poll_nointr(struct pollfd *pfd, unsigned int num_pfd)
+{
+	int ret;
+
+	do {
+		ret = poll(pfd, num_pfd, -1);
+	} while (ret == -1 && errno == EINTR);
+
+	return ret;
 }
 
 #endif /* __OPS_H__ */

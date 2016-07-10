@@ -1,3 +1,9 @@
+libiio (0.7-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- A. Maitland Bottoms <bottoms@debian.org>  Sun, 10 Jul 2016 11:34:33 -0400
+
 libiio (0.6.187-1) unstable; urgency=medium
 
   * update to v0.6-187-g5d107e9

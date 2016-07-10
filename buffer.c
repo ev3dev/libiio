@@ -156,8 +156,10 @@ ssize_t iio_buffer_push(struct iio_buffer *buffer)
 		void *buf;
 		ret = dev->ctx->ops->get_buffer(dev, &buf,
 				buffer->data_length, buffer->mask, dev->words);
-		if (ret >= 0)
+		if (ret >= 0) {
 			buffer->buffer = buf;
+			ret = (ssize_t) buffer->data_length;
+		}
 	} else {
 		void *ptr = buffer->buffer;
 		size_t tmp_len;
@@ -301,4 +303,12 @@ void * iio_buffer_get_data(const struct iio_buffer *buf)
 const struct iio_device * iio_buffer_get_device(const struct iio_buffer *buf)
 {
 	return buf->dev;
+}
+
+void iio_buffer_cancel(struct iio_buffer *buf)
+{
+	const struct iio_backend_ops *ops = buf->dev->ctx->ops;
+
+	if (ops->cancel)
+		ops->cancel(buf->dev);
 }

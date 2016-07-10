@@ -21,6 +21,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef _WIN32
+#define _strdup strdup
+#endif
+
 #define MY_NAME "iio_genxml"
 
 enum backend {
@@ -120,7 +124,7 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	xml = strdup(iio_context_get_xml(ctx));
+	xml = _strdup(iio_context_get_xml(ctx));
 	if (!xml) {
 		iio_context_destroy(ctx);
 		return EXIT_FAILURE;
@@ -134,7 +138,7 @@ int main(int argc, char **argv)
 	if (!ctx) {
 		fprintf(stderr, "Unable to re-generate context\n");
 	} else {
-		printf("Context re-creation from generated XML suceeded!\n");
+		printf("Context re-creation from generated XML succeeded!\n");
 		iio_context_destroy(ctx);
 	}
 	free(xml);
