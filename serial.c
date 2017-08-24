@@ -356,7 +356,7 @@ static struct iio_context * serial_create_context(const char *port_name,
 		goto err_close_port;
 	}
 
-	snprintf(description, desc_len, "%s: %s", name, desc);
+	iio_snprintf(description, desc_len, "%s: %s", name, desc);
 
 	pdata = zalloc(sizeof(*pdata));
 	if (!pdata) {
@@ -503,7 +503,7 @@ struct iio_context * serial_create_context_from_uri(const char *uri)
 	if (strncmp(uri, "serial:", sizeof("serial:") - 1) != 0)
 		goto err_bad_uri;
 
-	uri_dup = _strdup((const char *)
+	uri_dup = iio_strdup((const char *)
 			((uintptr_t) uri + sizeof("serial:") - 1));
 	if (!uri_dup) {
 		errno = ENOMEM;
@@ -530,6 +530,6 @@ err_free_dup:
 	free(uri_dup);
 err_bad_uri:
 	ERROR("Bad URI: \'%s\'\n", uri);
-	errno = -EINVAL;
+	errno = EINVAL;
 	return NULL;
 }

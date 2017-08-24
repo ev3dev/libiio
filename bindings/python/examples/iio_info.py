@@ -14,46 +14,76 @@
 # Lesser General Public License for more details.
 
 import iio
+from sys import argv
 
 def main():
-	ctx = iio.Context()
+	print('Library version: %u.%u (git tag: %s)' % iio.version)
 
-	print 'Library version: %u.%u (git tag: %s)' % iio.version
+	if len(argv) == 3 and argv[1] == '--uri':
+		uri = argv[2]
+	else:
+		contexts = iio.scan_contexts()
+		if len(contexts) > 1:
+			print('Multiple contexts found. Please select one using --uri:')
+			for index, each in enumerate(contexts):
+				print('\t%d: %s [%s]' % (index, contexts[each], each))
+			return
 
-	print 'IIO context created: ' + ctx.name
-	print 'Backend version: %u.%u (git tag: %s)' % ctx.version
-	print 'Backend description string: ' + ctx.description
+		uri = next(iter(contexts), None)
 
-	print 'IIO context has %u devices:' % len(ctx.devices)
+	ctx = iio.Context(uri)
+
+	if uri is not None:
+		print('Using auto-detected IIO context at URI \"%s\"' % uri)
+
+	print('IIO context created: ' + ctx.name)
+	print('Backend version: %u.%u (git tag: %s)' % ctx.version)
+	print('Backend description string: ' + ctx.description)
+
+	if len(ctx.attrs) > 0:
+		print('IIO context has %u attributes:' % len(ctx.attrs))
+	for attr, value in ctx.attrs.items():
+		print('\t' + attr + ': ' + value)
+
+	print('IIO context has %u devices:' % len(ctx.devices))
 
 	for dev in ctx.devices:
-		print '\t' + dev.id + ': ' + dev.name
+		print('\t' + dev.id + ': ' + dev.name)
 
 		if dev is iio.Trigger:
-			print 'Found trigger! Rate: %u Hz' % dev.frequency
+			print('Found trigger! Rate: %u Hz' % dev.frequency)
 
-		print '\t\t%u channels found:' % len(dev.channels)
+		print('\t\t%u channels found:' % len(dev.channels))
 
 		for chn in dev.channels:
-			print '\t\t\t%s: %s (%s)' % (chn.id, chn.name or "", 'output' if chn.output else 'input')
+			print('\t\t\t%s: %s (%s)' % (chn.id, chn.name or "", 'output' if chn.output else 'input'))
 
 			if len(chn.attrs) != 0:
-				print '\t\t\t%u channel-specific attributes found:' % len(chn.attrs)
+				print('\t\t\t%u channel-specific attributes found:' % len(chn.attrs))
 
 			for attr in chn.attrs:
-				print '\t\t\t\t' + attr + ', value: ' + chn.attrs[attr].value
+				try:
+					print('\t\t\t\t' + attr + ', value: ' + chn.attrs[attr].value)
+				except OSError as e:
+					print('Unable to read ' + attr + ': ' + e.strerror)
 
 		if len(dev.attrs) != 0:
-			print '\t\t%u device-specific attributes found:' % len(dev.attrs)
+			print('\t\t%u device-specific attributes found:' % len(dev.attrs))
 
 		for attr in dev.attrs:
-			print '\t\t\t' + attr + ', value: ' + dev.attrs[attr].value
+			try:
+				print('\t\t\t' + attr + ', value: ' + dev.attrs[attr].value)
+			except OSError as e:
+				print('Unable to read ' + attr + ': ' + e.strerror)
 
 		if len(dev.debug_attrs) != 0:
-			print '\t\t%u debug attributes found:' % len(dev.debug_attrs)
+			print('\t\t%u debug attributes found:' % len(dev.debug_attrs))
 
 		for attr in dev.debug_attrs:
-			print '\t\t\t' + attr + ', value: ' + dev.debug_attrs[attr].value
+			try:
+				print('\t\t\t' + attr + ', value: ' + dev.debug_attrs[attr].value)
+			except OSError as e:
+				print('Unable to read ' + attr + ': ' + e.strerror)
 
 if __name__ == '__main__':
 	main()

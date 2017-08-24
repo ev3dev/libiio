@@ -18,13 +18,20 @@
 
 #define _BSD_SOURCE
 #define _GNU_SOURCE
+#define _DEFAULT_SOURCE
 
 #include <cdk/cdk.h>
-#include <iio.h>
+#include <locale.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <string.h>
+
+#ifdef __APPLE__
+#include <iio/iio.h>
+#else
+#include <iio.h>
+#endif
 
 #define ARRAY_SIZE(x) (sizeof(x) ? sizeof(x) / sizeof((x)[0]) : 0)
 
@@ -55,8 +62,12 @@ static bool is_valid_channel(struct iio_channel *chn)
 
 static double get_channel_value(struct iio_channel *chn)
 {
+	char *old_locale;
 	char buf[1024];
 	double val;
+
+	old_locale = strdup(setlocale(LC_NUMERIC, NULL));
+	setlocale(LC_NUMERIC, "C");
 
 	if (channel_has_attr(chn, "input")) {
 		iio_channel_attr_read(chn, "input", buf, sizeof(buf));
@@ -76,7 +87,33 @@ static double get_channel_value(struct iio_channel *chn)
 		}
 	}
 
+	setlocale(LC_NUMERIC, old_locale);
+	free(old_locale);
+
 	return val / 1000.0;
+}
+
+static struct {
+	const char *id;
+	const char *unit;
+} map[] = {
+	{ "current",	"A" },
+	{ "power",	"W" },
+	{ "temp",	"°C" },
+	{ "voltage",	"V" },
+	{ 0, },
+};
+
+static const char *id_to_unit(const char *id)
+{
+	unsigned int i;
+
+	for (i = 0; map[i].id; i++) {
+		if (!strncmp(id, map[i].id, strlen(map[i].id)))
+			return map[i].unit;
+	}
+
+	return "";
 }
 
 static void * read_thd(void *d)
@@ -117,7 +154,7 @@ static void * read_thd(void *d)
 		nb_channels = iio_device_get_channels_count(dev);
 		for (i = 0; i < nb_channels; i++) {
 			const char *id;
-			bool is_temp = false;
+			const char *unit;
 			struct iio_channel *chn =
 				iio_device_get_channel(dev, i);
 			if (!is_valid_channel(chn))
@@ -128,7 +165,7 @@ static void * read_thd(void *d)
 			id = iio_channel_get_id(chn);
 			if (!name)
 				name = id;
-			is_temp = !strncmp(id, "temp", 4);
+			unit = id_to_unit(id);
 
 			sprintf(buf, "</%u></B>%s<!B><!%u>",
 					BLUE, name, BLUE);
@@ -138,8 +175,8 @@ static void * read_thd(void *d)
 			freeChtype(str);
 
 			sprintf(buf, "</%u></B>%.3lf %s<!B><!%u>",
-					YELLOW, get_channel_value(chn),
-					is_temp ? "°C" : "V", YELLOW);
+					YELLOW, get_channel_value(chn), unit,
+					YELLOW);
 			str = char2Chtype(buf, &len, &align);
 			writeChtype(right, col / 2, line++,
 					str, HORIZONTAL, 0, len);

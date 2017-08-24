@@ -15,6 +15,7 @@
  * Lesser General Public License for more details.
  */
 
+#include "iio-config.h"
 #include "iio-private.h"
 
 #include <errno.h>
@@ -22,7 +23,7 @@
 #include <string.h>
 
 struct iio_scan_context {
-#if USB_BACKEND
+#ifdef WITH_USB_BACKEND
 	struct iio_scan_backend_context *usb_ctx;
 #endif
 	bool scan_local;
@@ -45,7 +46,7 @@ ssize_t iio_scan_context_get_info_list(struct iio_scan_context *ctx,
 {
 	struct iio_scan_result scan_result = { 0, NULL };
 
-#if LOCAL_BACKEND
+#ifdef WITH_LOCAL_BACKEND
 	if (ctx->scan_local) {
 		int ret = local_context_scan(&scan_result);
 		if (ret < 0) {
@@ -56,7 +57,7 @@ ssize_t iio_scan_context_get_info_list(struct iio_scan_context *ctx,
 	}
 #endif
 
-#if USB_BACKEND
+#ifdef WITH_USB_BACKEND
 	if (ctx->usb_ctx) {
 		int ret = usb_context_scan(ctx->usb_ctx, &scan_result);
 		if (ret < 0) {
@@ -104,7 +105,10 @@ struct iio_context_info ** iio_scan_result_add(
 
 	info = realloc(scan_result->info, (new_size + 1) * sizeof(*info));
 	if (!info)
-		goto err_free_info_list;
+		return NULL;
+
+	scan_result->info = info;
+	scan_result->size = new_size;
 
 	for (i = old_size; i < new_size; i++) {
 		/* Make sure iio_context_info_list_free won't overflow */
@@ -112,18 +116,10 @@ struct iio_context_info ** iio_scan_result_add(
 
 		info[i] = zalloc(sizeof(**info));
 		if (!info[i])
-			goto err_free_info_list;
+			return NULL;
 	}
 
-	scan_result->info = info;
-	scan_result->size = new_size;
-
 	return &info[old_size];
-
-err_free_info_list:
-	scan_result->size = 0;
-	iio_context_info_list_free(scan_result->info);
-	return NULL;
 }
 
 struct iio_scan_context * iio_create_scan_context(
@@ -146,7 +142,7 @@ struct iio_scan_context * iio_create_scan_context(
 	if (!backend || !strcmp(backend, "local"))
 		ctx->scan_local = true;
 
-#if USB_BACKEND
+#ifdef WITH_USB_BACKEND
 	if (!backend || !strcmp(backend, "usb"))
 		ctx->usb_ctx = usb_context_scan_init();
 #endif
@@ -156,9 +152,63 @@ struct iio_scan_context * iio_create_scan_context(
 
 void iio_scan_context_destroy(struct iio_scan_context *ctx)
 {
-#if USB_BACKEND
+#ifdef WITH_USB_BACKEND
 	if (ctx->usb_ctx)
 		usb_context_scan_free(ctx->usb_ctx);
 #endif
 	free(ctx);
 }
+
+#ifdef WITH_MATLAB_BINDINGS_API
+
+struct iio_scan_block {
+	struct iio_scan_context *ctx;
+	struct iio_context_info **info;
+	ssize_t ctx_cnt;
+};
+
+ssize_t iio_scan_block_scan(struct iio_scan_block *blk)
+{
+	iio_context_info_list_free(blk->info);
+	blk->info = NULL;
+	blk->ctx_cnt = iio_scan_context_get_info_list(blk->ctx, &blk->info);
+	return blk->ctx_cnt;
+}
+
+struct iio_context_info *iio_scan_block_get_info(
+		struct iio_scan_block *blk, unsigned int index)
+{
+	if (!blk->info || (ssize_t)index >= blk->ctx_cnt) {
+		errno = EINVAL;
+		return NULL;
+	}
+	return blk->info[index];
+}
+
+struct iio_scan_block *iio_create_scan_block(
+		const char *backend, unsigned int flags)
+{
+	struct iio_scan_block *blk;
+
+	blk = calloc(1, sizeof(*blk));
+	if (!blk) {
+		errno = ENOMEM;
+		return NULL;
+	}
+
+	blk->ctx = iio_create_scan_context(backend, flags);
+	if (!blk->ctx) {
+		free(blk);
+		return NULL;
+	}
+
+	return blk;
+}
+
+void iio_scan_block_destroy(struct iio_scan_block *blk)
+{
+	iio_context_info_list_free(blk->info);
+	iio_scan_context_destroy(blk->ctx);
+	free(blk);
+}
+#endif

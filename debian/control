@@ -12,7 +12,7 @@ Build-Depends: bison,
                flex,
                libxml2-dev,
                python
-Standards-Version: 3.9.8
+Standards-Version: 4.0.0
 Homepage: https://github.com/analogdevicesinc/libiio
 Vcs-Git: https://github.com/analogdevicesinc/libiio.git
 
@@ -42,7 +42,10 @@ Description: libiio development files
 
 Package: iiod
 Architecture: any
-Depends: libiio0 (>= ${binary:Version}), ${misc:Depends}, ${shlibs:Depends}
+Depends: libiio0 (>= ${binary:Version}),
+         lsb-base (>=3.0-6),
+         ${misc:Depends},
+         ${shlibs:Depends}
 Section: net
 Suggests: avahi-daemon
 Description: Daemon to share IIO devices on the network
@@ -85,7 +88,9 @@ Description: CLI bindings for libiio
 Package: libiio-cil-dev
 Section: cli-mono
 Architecture: all
-Depends: libiio0-cil (>= ${source:Version}), ${misc:Depends}
+Depends: libiio0-cil (>= ${source:Upstream-Version}),
+         libiio0-cil (<< ${source:Upstream-Version}+1~),
+         ${misc:Depends}
 Description: CLI bindings for libiio (development)
  Libiio is a library that has been conceived to ease the development of
  applications interfacing Industrial Input/Output (IIO) devices through

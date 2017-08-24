@@ -1,8 +1,15 @@
 cmake_minimum_required(VERSION 2.8.7)
 project(libiio-sharp NONE)
 
+if (WIN32)
+	set(MCS_EXECUTABLE_NAME csc)
+else()
+	set(MCS_EXECUTABLE_NAME mcs)
+endif()
+
 find_program(MCS_EXECUTABLE
-	NAMES mcs csc
+	NAMES ${MCS_EXECUTABLE_NAME}
+	HINTS "C:/Windows/Microsoft.NET/Framework/v4.0.30319"
 	PATHS ENV MCS_EXECUTABLE_PATH
 	DOC "C# compiler")
 mark_as_advanced(MCS_EXECUTABLE)
@@ -14,12 +21,16 @@ if (MCS_EXECUTABLE)
 		set(LIBIIO_CS_PC_IN "${CMAKE_CURRENT_SOURCE_DIR}/libiio-sharp.pc.cmakein")
 		set(LIBIIO_CS_PC "${CMAKE_CURRENT_BINARY_DIR}/libiio-sharp-${VERSION}.pc")
 		configure_file(${LIBIIO_CS_PC_IN} ${LIBIIO_CS_PC} @ONLY)
-		install(FILES ${LIBIIO_CS_PC} DESTINATION "${CMAKE_INSTALL_PREFIX}/lib/pkgconfig")
+		if(NOT SKIP_INSTALL_ALL)
+			install(FILES ${LIBIIO_CS_PC} DESTINATION "${CMAKE_INSTALL_PREFIX}/lib/pkgconfig")
+		endif()
 
 		set(LIBIIO_CS_DLL_CONFIG_IN "${CMAKE_CURRENT_SOURCE_DIR}/libiio-sharp.dll.config.cmakein")
 		set(LIBIIO_CS_DLL_CONFIG "${CMAKE_CURRENT_BINARY_DIR}/libiio-sharp.dll.config")
 		configure_file(${LIBIIO_CS_DLL_CONFIG_IN} ${LIBIIO_CS_DLL_CONFIG} @ONLY)
-		install(FILES ${LIBIIO_CS_DLL_CONFIG} DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/cli/libiio-sharp-${VERSION})
+		if(NOT SKIP_INSTALL_ALL)
+			install(FILES ${LIBIIO_CS_DLL_CONFIG} DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/cli/libiio-sharp-${VERSION})
+		endif()
 
 		set(LIBIIO_CS_VERSION ${VERSION}.0.0)
 		set(LIBIIO_CS_INFO_IN ${CMAKE_CURRENT_SOURCE_DIR}/AssemblyInfo.cs.in)
@@ -52,6 +63,8 @@ if (MCS_EXECUTABLE)
 
 		add_custom_target(libiio-sharp ALL DEPENDS ${LIBIIO_CS_DLL})
 
-		install(FILES ${LIBIIO_CS_DLL} ${LIBIIO_CS_DLL}.mdb DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/cli/libiio-sharp-${VERSION})
+		if(NOT SKIP_INSTALL_ALL)
+			install(FILES ${LIBIIO_CS_DLL} ${LIBIIO_CS_DLL}.mdb DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/cli/libiio-sharp-${VERSION})
+		endif()
 	endif()
 endif()

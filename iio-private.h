@@ -22,19 +22,15 @@
 /* Include public interface */
 #include "iio.h"
 
+#include "iio-config.h"
+
 #include <stdbool.h>
 
 #ifdef _MSC_BUILD
-#define snprintf sprintf_s
 #define inline __inline
-#endif
-#ifdef _WIN32
-#define strerror_r(err, buf, len) strerror_s(buf, len, err)
+#define iio_snprintf sprintf_s
 #else
-/* Visual Studio is unhappy with strdup(); so we make libiio use the C++
- * compliant _strdup() on Windows, and revert to the POSIX strdup() everywhere
- * else.*/
-#define _strdup strdup
+#define iio_snprintf snprintf
 #endif
 
 #ifdef _WIN32
@@ -47,6 +43,10 @@
 #   define __api __attribute__((visibility ("default")))
 #else
 #   define __api
+#endif
+
+#ifdef WITH_MATLAB_BINDINGS_API
+#include "bindings/matlab/iio-wrapper.h"
 #endif
 
 #define ARRAY_SIZE(x) (sizeof(x) ? sizeof(x) / sizeof((x)[0]) : 0)
@@ -152,6 +152,10 @@ struct iio_context {
 	unsigned int nb_devices;
 
 	char *xml;
+
+	char **attrs;
+	char **values;
+	unsigned int nb_attrs;
 };
 
 struct iio_channel {
@@ -169,6 +173,8 @@ struct iio_channel {
 
 	struct iio_channel_attr *attrs;
 	unsigned int nb_attrs;
+
+	unsigned int number;
 };
 
 struct iio_device {
@@ -237,9 +243,6 @@ int iio_device_get_poll_fd(const struct iio_device *dev);
 
 int read_double(const char *str, double *val);
 int write_double(char *buf, size_t len, double val);
-#ifndef _WIN32
-int set_blocking_mode(int fd, bool blocking);
-#endif
 
 struct iio_context * local_create_context(void);
 struct iio_context * network_create_context(const char *hostname);
@@ -264,6 +267,11 @@ __api ssize_t iio_device_get_sample_size_mask(const struct iio_device *dev,
 
 void iio_channel_init_finalize(struct iio_channel *chn);
 unsigned int find_channel_modifier(const char *s, size_t *len_p);
+
+char *iio_strdup(const char *str);
+
+int iio_context_add_attr(struct iio_context *ctx,
+		const char *key, const char *value);
 
 #undef __api
 

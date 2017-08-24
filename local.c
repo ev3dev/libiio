@@ -38,6 +38,9 @@
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef WITH_LOCAL_CONFIG
+#include <ini.h>
+#endif
 
 #define DEFAULT_TIMEOUT_MS 1000
 
@@ -95,6 +98,12 @@ struct iio_device_pdata {
 	int cancel_fd;
 };
 
+struct iio_channel_pdata {
+	char *enable_fn;
+	struct iio_channel_attr *protected_attrs;
+	unsigned int nb_protected_attrs;
+};
+
 static const char * const device_attrs_blacklist[] = {
 	"dev",
 	"uevent",
@@ -111,9 +120,22 @@ static int ioctl_nointr(int fd, unsigned long request, void *data)
 	return ret;
 }
 
+static void local_free_channel_pdata(struct iio_channel *chn)
+{
+	if (chn->pdata) {
+		free(chn->pdata->enable_fn);
+		free(chn->pdata);
+	}
+}
+
 static void local_free_pdata(struct iio_device *device)
 {
-	if (device && device->pdata) {
+	unsigned int i;
+
+	for (i = 0; i < device->nb_channels; i++)
+		local_free_channel_pdata(device->channels[i]);
+
+	if (device->pdata) {
 		free(device->pdata->blocks);
 		free(device->pdata->addrs);
 		free(device->pdata);
@@ -125,8 +147,12 @@ static void local_shutdown(struct iio_context *ctx)
 	/* Free the backend data stored in every device structure */
 	unsigned int i;
 
-	for (i = 0; i < ctx->nb_devices; i++)
-		local_free_pdata(ctx->devices[i]);
+	for (i = 0; i < ctx->nb_devices; i++) {
+		struct iio_device *dev = ctx->devices[i];
+
+		iio_device_close(dev);
+		local_free_pdata(dev);
+	}
 
 	free(ctx->pdata);
 }
@@ -143,15 +169,19 @@ static void strcut(char *str, int nb)
 
 static int set_channel_name(struct iio_channel *chn)
 {
+	struct iio_channel_pdata *pdata = chn->pdata;
 	size_t prefix_len = 0;
 	const char *attr0;
 	const char *ptr;
 	unsigned int i;
 
-	if (chn->nb_attrs < 2)
+	if (chn->nb_attrs + pdata->nb_protected_attrs < 2)
 		return 0;
 
-	attr0 = ptr = chn->attrs[0].name;
+	if (chn->nb_attrs)
+		attr0 = ptr = chn->attrs[0].name;
+	else
+		attr0 = ptr = pdata->protected_attrs[0].name;
 
 	while (true) {
 		bool can_fix = true;
@@ -164,6 +194,12 @@ static int set_channel_name(struct iio_channel *chn)
 		len = ptr - attr0 + 1;
 		for (i = 1; can_fix && i < chn->nb_attrs; i++)
 			can_fix = !strncmp(attr0, chn->attrs[i].name, len);
+
+		for (i = !chn->nb_attrs;
+				can_fix && i < pdata->nb_protected_attrs; i++) {
+			can_fix = !strncmp(attr0,
+					pdata->protected_attrs[i].name, len);
+		}
 
 		if (!can_fix)
 			break;
@@ -186,6 +222,8 @@ static int set_channel_name(struct iio_channel *chn)
 		/* Shrink the attribute name */
 		for (i = 0; i < chn->nb_attrs; i++)
 			strcut(chn->attrs[i].name, prefix_len);
+		for (i = 0; i < pdata->nb_protected_attrs; i++)
+			strcut(pdata->protected_attrs[i].name, prefix_len);
 	}
 
 	return 0;
@@ -301,7 +339,7 @@ static ssize_t local_read(const struct iio_device *dev,
 		if (ret == -1) {
 			if (pdata->blocking && errno == EAGAIN)
 				continue;
-			ret = -EIO;
+			ret = -errno;
 			break;
 		} else if (ret == 0) {
 			ret = -EIO;
@@ -349,7 +387,7 @@ static ssize_t local_write(const struct iio_device *dev,
 			if (pdata->blocking && errno == EAGAIN)
 				continue;
 
-			ret = -EIO;
+			ret = -errno;
 			break;
 		} else if (ret == 0) {
 			ret = -EIO;
@@ -609,12 +647,14 @@ static ssize_t local_read_dev_attr(const struct iio_device *dev,
 	if (!attr)
 		return local_read_all_dev_attrs(dev, dst, len, is_debug);
 
-	if (is_debug)
-		snprintf(buf, sizeof(buf), "/sys/kernel/debug/iio/%s/%s",
+	if (is_debug) {
+		iio_snprintf(buf, sizeof(buf), "/sys/kernel/debug/iio/%s/%s",
 				dev->id, attr);
-	else
-		snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
+	} else {
+		iio_snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
 				dev->id, attr);
+	}
+
 	f = fopen(buf, "re");
 	if (!f)
 		return -errno;
@@ -639,12 +679,14 @@ static ssize_t local_write_dev_attr(const struct iio_device *dev,
 	if (!attr)
 		return local_write_all_dev_attrs(dev, src, len, is_debug);
 
-	if (is_debug)
-		snprintf(buf, sizeof(buf), "/sys/kernel/debug/iio/%s/%s",
+	if (is_debug) {
+		iio_snprintf(buf, sizeof(buf), "/sys/kernel/debug/iio/%s/%s",
 				dev->id, attr);
-	else
-		snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
+	} else {
+		iio_snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
 				dev->id, attr);
+	}
+
 	f = fopen(buf, "we");
 	if (!f)
 		return -errno;
@@ -690,7 +732,14 @@ static ssize_t local_write_chn_attr(const struct iio_channel *chn,
 static int channel_write_state(const struct iio_channel *chn)
 {
 	char *en = iio_channel_is_enabled(chn) ? "1" : "0";
-	ssize_t ret = local_write_chn_attr(chn, "en", en, 2);
+	ssize_t ret;
+
+	if (!chn->pdata->enable_fn) {
+		ERROR("Libiio bug: No \"en\" attribute parsed\n");
+		return -EINVAL;
+	}
+
+	ret = local_write_chn_attr(chn, chn->pdata->enable_fn, en, 2);
 	if (ret < 0)
 		return (int) ret;
 	else
@@ -793,7 +842,7 @@ static int local_open(const struct iio_device *dev,
 	if (ret < 0)
 		return ret;
 
-	snprintf(buf, sizeof(buf), "%lu", (unsigned long) samples_count);
+	iio_snprintf(buf, sizeof(buf), "%lu", (unsigned long) samples_count);
 	ret = local_write_dev_attr(dev, "buffer/length",
 			buf, strlen(buf) + 1, false);
 	if (ret < 0)
@@ -803,7 +852,7 @@ static int local_open(const struct iio_device *dev,
 	if (pdata->cancel_fd == -1)
 		return -errno;
 
-	snprintf(buf, sizeof(buf), "/dev/%s", dev->id);
+	iio_snprintf(buf, sizeof(buf), "/dev/%s", dev->id);
 	pdata->fd = open(buf, O_RDWR | O_CLOEXEC | O_NONBLOCK);
 	if (pdata->fd == -1) {
 		ret = -errno;
@@ -840,13 +889,15 @@ static int local_open(const struct iio_device *dev,
 		WARNING("High-speed mode not enabled\n");
 
 		/* Cyclic mode is only supported in high-speed mode */
-		if (cyclic)
-			return -EPERM;
+		if (cyclic) {
+			ret = -EPERM;
+			goto err_close;
+		}
 
 		/* Increase the size of the kernel buffer, when using the
 		 * low-speed interface. This avoids losing samples when
 		 * refilling the iio_buffer. */
-		snprintf(buf, sizeof(buf), "%lu", size);
+		iio_snprintf(buf, sizeof(buf), "%lu", size);
 		ret = local_write_dev_attr(dev, "buffer/length",
 				buf, strlen(buf) + 1, false);
 		if (ret < 0)
@@ -870,6 +921,7 @@ err_close_cancel_fd:
 static int local_close(const struct iio_device *dev)
 {
 	struct iio_device_pdata *pdata = dev->pdata;
+	unsigned int i;
 	int ret;
 
 	if (pdata->fd == -1)
@@ -896,6 +948,16 @@ static int local_close(const struct iio_device *dev)
 	pdata->cancel_fd = -1;
 
 	ret = local_write_dev_attr(dev, "buffer/enable", "0", 2, false);
+
+	for (i = 0; i < dev->nb_channels; i++) {
+		struct iio_channel *chn = dev->channels[i];
+
+		if (chn->pdata->enable_fn) {
+			iio_channel_disable(chn);
+			channel_write_state(chn);
+		}
+	}
+
 	return (ret < 0) ? ret : 0;
 }
 
@@ -1016,7 +1078,7 @@ static char * get_short_attr_name(struct iio_channel *chn, const char *attr)
 			ptr += len + 1;
 	}
 
-	return strdup(ptr);
+	return iio_strdup(ptr);
 }
 
 static int read_device_name(struct iio_device *dev)
@@ -1028,7 +1090,7 @@ static int read_device_name(struct iio_device *dev)
 	else if (ret == 0)
 		return -EIO;
 
-	dev->name = strdup(buf);
+	dev->name = iio_strdup(buf);
 	if (!dev->name)
 		return -ENOMEM;
 	else
@@ -1047,7 +1109,7 @@ static int add_attr_to_device(struct iio_device *dev, const char *attr)
 	if (!strcmp(attr, "name"))
 		return read_device_name(dev);
 
-	name = strdup(attr);
+	name = iio_strdup(attr);
 	if (!name)
 		return -ENOMEM;
 
@@ -1063,17 +1125,127 @@ static int add_attr_to_device(struct iio_device *dev, const char *attr)
 	return 0;
 }
 
+static int handle_protected_scan_element_attr(struct iio_channel *chn,
+			const char *name, const char *path)
+{
+	struct iio_device *dev = chn->dev;
+	char buf[1024];
+	int ret;
+
+	if (!strcmp(name, "index")) {
+		ret = local_read_dev_attr(dev, path, buf, sizeof(buf), false);
+		if (ret > 0)
+			chn->index = atol(buf);
+
+	} else if (!strcmp(name, "type")) {
+		ret = local_read_dev_attr(dev, path, buf, sizeof(buf), false);
+		if (ret > 0) {
+			char endian, sign;
+
+			if (strchr(buf, 'X')) {
+				sscanf(buf, "%ce:%c%u/%uX%u>>%u", &endian, &sign,
+					&chn->format.bits, &chn->format.length,
+					&chn->format.repeat, &chn->format.shift);
+			} else {
+				chn->format.repeat = 1;
+				sscanf(buf, "%ce:%c%u/%u>>%u", &endian, &sign,
+					&chn->format.bits, &chn->format.length,
+					&chn->format.shift);
+			}
+			chn->format.is_signed = (sign == 's' || sign == 'S');
+			chn->format.is_fully_defined =
+					(sign == 'S' || sign == 'U'||
+					chn->format.bits == chn->format.length);
+			chn->format.is_be = endian == 'b';
+		}
+
+	} else if (!strcmp(name, "en")) {
+		if (chn->pdata->enable_fn) {
+			ERROR("Libiio bug: \"en\" attribute already parsed for channel %s!\n",
+					chn->id);
+			return -EINVAL;
+		}
+
+		chn->pdata->enable_fn = iio_strdup(path);
+		if (!chn->pdata->enable_fn)
+			return -ENOMEM;
+
+	} else {
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int handle_scan_elements(struct iio_channel *chn)
+{
+	struct iio_channel_pdata *pdata = chn->pdata;
+	unsigned int i;
+
+	for (i = 0; i < pdata->nb_protected_attrs; i++) {
+		int ret = handle_protected_scan_element_attr(chn,
+				pdata->protected_attrs[i].name,
+				pdata->protected_attrs[i].filename);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
+static int add_protected_attr(struct iio_channel *chn, char *name, char *fn)
+{
+	struct iio_channel_pdata *pdata = chn->pdata;
+	struct iio_channel_attr *attrs;
+
+	attrs = realloc(pdata->protected_attrs,
+			(1 + pdata->nb_protected_attrs) * sizeof(*attrs));
+	if (!attrs)
+		return -ENOMEM;
+
+	attrs[pdata->nb_protected_attrs].name = name;
+	attrs[pdata->nb_protected_attrs++].filename = fn;
+	pdata->protected_attrs = attrs;
+
+	DEBUG("Add protected attr \'%s\' to channel \'%s\'\n", name, chn->id);
+	return 0;
+}
+
+static void free_protected_attrs(struct iio_channel *chn)
+{
+	struct iio_channel_pdata *pdata = chn->pdata;
+	unsigned int i;
+
+	for (i = 0; i < pdata->nb_protected_attrs; i++) {
+		free(pdata->protected_attrs[i].name);
+		free(pdata->protected_attrs[i].filename);
+	}
+
+	free(pdata->protected_attrs);
+	pdata->nb_protected_attrs = 0;
+	pdata->protected_attrs = NULL;
+}
+
 static int add_attr_to_channel(struct iio_channel *chn,
-		const char *attr, const char *path)
+		const char *attr, const char *path, bool is_scan_element)
 {
 	struct iio_channel_attr *attrs;
 	char *fn, *name = get_short_attr_name(chn, attr);
 	if (!name)
 		return -ENOMEM;
 
-	fn = strdup(path);
+	fn = iio_strdup(path);
 	if (!fn)
 		goto err_free_name;
+
+	if (is_scan_element) {
+		int ret = add_protected_attr(chn, name, fn);
+
+		if (ret < 0)
+			goto err_free_fn;
+
+		return 0;
+	}
 
 	attrs = realloc(chn->attrs, (1 + chn->nb_attrs) *
 			sizeof(struct iio_channel_attr));
@@ -1122,23 +1294,33 @@ static int add_device_to_context(struct iio_context *ctx,
 }
 
 static struct iio_channel *create_channel(struct iio_device *dev,
-		char *id, const char *attr, const char *path)
+		char *id, const char *attr, const char *path,
+		bool is_scan_element)
 {
 	struct iio_channel *chn = zalloc(sizeof(*chn));
 	if (!chn)
 		return NULL;
 
+	chn->pdata = zalloc(sizeof(*chn->pdata));
+	if (!chn->pdata)
+		goto err_free_chn;
+
 	if (!strncmp(attr, "out_", 4))
 		chn->is_output = true;
 	else if (strncmp(attr, "in_", 3))
-		goto err_free_chn;
+		goto err_free_chn_pdata;
 
 	chn->dev = dev;
 	chn->id = id;
+	chn->is_scan_element = is_scan_element;
+	chn->index = -ENOENT;
 
-	if (!add_attr_to_channel(chn, attr, path))
+	if (!add_attr_to_channel(chn, attr, path, is_scan_element))
 		return chn;
 
+err_free_chn_pdata:
+	free(chn->pdata->enable_fn);
+	free(chn->pdata);
 err_free_chn:
 	free(chn);
 	return NULL;
@@ -1161,13 +1343,14 @@ static int add_channel(struct iio_device *dev, const char *name,
 		if (!strcmp(chn->id, channel_id)
 				&& chn->is_output == (name[0] == 'o')) {
 			free(channel_id);
-			ret = add_attr_to_channel(chn, name, path);
+			ret = add_attr_to_channel(chn, name, path,
+					dir_is_scan_elements);
 			chn->is_scan_element = dir_is_scan_elements && !ret;
 			return ret;
 		}
 	}
 
-	chn = create_channel(dev, channel_id, name, path);
+	chn = create_channel(dev, channel_id, name, path, dir_is_scan_elements);
 	if (!chn) {
 		free(channel_id);
 		return -ENXIO;
@@ -1176,10 +1359,11 @@ static int add_channel(struct iio_device *dev, const char *name,
 	iio_channel_init_finalize(chn);
 
 	ret = add_channel_to_device(dev, chn);
-	if (ret)
+	if (ret) {
+		free(chn->pdata->enable_fn);
+		free(chn->pdata);
 		free_channel(chn);
-	else
-		chn->is_scan_element = dir_is_scan_elements;
+	}
 	return ret;
 }
 
@@ -1240,7 +1424,7 @@ static int detect_global_attr(struct iio_device *dev, const char *attr,
 		if (is_global_attr(chn, attr) == level) {
 			int ret;
 			*match = true;
-			ret = add_attr_to_channel(chn, attr, attr);
+			ret = add_attr_to_channel(chn, attr, attr, false);
 			if (ret)
 				return ret;
 		}
@@ -1314,7 +1498,7 @@ static int add_attr_or_channel_helper(struct iio_device *dev,
 	const char *name = strrchr(path, '/') + 1;
 
 	if (dir_is_scan_elements) {
-		snprintf(buf, sizeof(buf), "scan_elements/%s", name);
+		iio_snprintf(buf, sizeof(buf), "scan_elements/%s", name);
 		path = buf;
 	} else {
 		if (!is_channel(name, true))
@@ -1338,43 +1522,36 @@ static int add_scan_element(void *d, const char *path)
 static int foreach_in_dir(void *d, const char *path, bool is_dir,
 		int (*callback)(void *, const char *))
 {
-	long name_max;
-	struct dirent *entry, *result;
-	DIR *dir = opendir(path);
+	struct dirent *entry;
+	DIR *dir;
+	int ret = 0;
+
+	dir = opendir(path);
 	if (!dir)
 		return -errno;
-
-	name_max = pathconf(path, _PC_NAME_MAX);
-	if (name_max == -1)
-		name_max = 255;
-	entry = malloc(offsetof(struct dirent, d_name) + name_max + 1);
-	if (!entry) {
-		closedir(dir);
-		return -ENOMEM;
-	}
 
 	while (true) {
 		struct stat st;
 		char buf[1024];
-		int ret = readdir_r(dir, entry, &result);
-		if (ret) {
-			iio_strerror(ret, buf, sizeof(buf));
-			ERROR("Unable to open directory %s: %s\n", path, buf);
-			free(entry);
-			closedir(dir);
-			return -ret;
-		}
-		if (!result)
-			break;
 
-		snprintf(buf, sizeof(buf), "%s/%s", path, entry->d_name);
+		errno = 0;
+		entry = readdir(dir);
+		if (!entry) {
+			if (!errno)
+				break;
+
+			ret = -errno;
+			iio_strerror(errno, buf, sizeof(buf));
+			ERROR("Unable to open directory %s: %s\n", path, buf);
+			goto out_close_dir;
+		}
+
+		iio_snprintf(buf, sizeof(buf), "%s/%s", path, entry->d_name);
 		if (stat(buf, &st) < 0) {
 			ret = -errno;
 			iio_strerror(errno, buf, sizeof(buf));
 			ERROR("Unable to stat file: %s\n", buf);
-			free(entry);
-			closedir(dir);
-			return ret;
+			goto out_close_dir;
 		}
 
 		if (is_dir && S_ISDIR(st.st_mode) && entry->d_name[0] != '.')
@@ -1384,23 +1561,21 @@ static int foreach_in_dir(void *d, const char *path, bool is_dir,
 		else
 			continue;
 
-		if (ret < 0) {
-			free(entry);
-			closedir(dir);
-			return ret;
-		}
+		if (ret < 0)
+			goto out_close_dir;
 	}
 
-	free(entry);
+out_close_dir:
 	closedir(dir);
-	return 0;
+	return ret;
 }
 
 static int add_scan_elements(struct iio_device *dev, const char *devpath)
 {
 	struct stat st;
 	char buf[1024];
-	snprintf(buf, sizeof(buf), "%s/scan_elements", devpath);
+
+	iio_snprintf(buf, sizeof(buf), "%s/scan_elements", devpath);
 
 	if (!stat(buf, &st) && S_ISDIR(st.st_mode)) {
 		int ret = foreach_in_dir(dev, buf, false, add_scan_element);
@@ -1432,7 +1607,7 @@ static int create_device(void *d, const char *path)
 	dev->pdata->nb_blocks = NB_BLOCKS;
 
 	dev->ctx = ctx;
-	dev->id = strdup(strrchr(path, '/') + 1);
+	dev->id = iio_strdup(strrchr(path, '/') + 1);
 	if (!dev->id) {
 		local_free_pdata(dev);
 		free(dev);
@@ -1440,40 +1615,48 @@ static int create_device(void *d, const char *path)
 	}
 
 	ret = foreach_in_dir(dev, path, false, add_attr_or_channel);
-	if (ret < 0) {
-		free_device(dev);
-		return ret;
-	}
+	if (ret < 0)
+		goto err_free_device;
 
 	ret = add_scan_elements(dev, path);
-	if (ret < 0) {
-		free_device(dev);
-		return ret;
-	}
+	if (ret < 0)
+		goto err_free_scan_elements;
 
-	for (i = 0; i < dev->nb_channels; i++)
-		set_channel_name(dev->channels[i]);
+	for (i = 0; i < dev->nb_channels; i++) {
+		struct iio_channel *chn = dev->channels[i];
+
+		set_channel_name(chn);
+		ret = handle_scan_elements(chn);
+		free_protected_attrs(chn);
+		if (ret < 0)
+			goto err_free_scan_elements;
+	}
 
 	ret = detect_and_move_global_attrs(dev);
-	if (ret < 0) {
-		free_device(dev);
-		return ret;
-	}
+	if (ret < 0)
+		goto err_free_device;
 
 	dev->words = (dev->nb_channels + 31) / 32;
 	if (dev->words) {
 		mask = calloc(dev->words, sizeof(*mask));
 		if (!mask) {
-			free_device(dev);
-			return ret;
+			ret = -ENOMEM;
+			goto err_free_device;
 		}
 	}
 
 	dev->mask = mask;
 
 	ret = add_device_to_context(ctx, dev);
-	if (ret < 0)
-		free_device(dev);
+	if (!ret)
+		return 0;
+
+err_free_scan_elements:
+	for (i = 0; i < dev->nb_channels; i++)
+		free_protected_attrs(dev->channels[i]);
+err_free_device:
+	local_free_pdata(dev);
+	free_device(dev);
 	return ret;
 }
 
@@ -1481,7 +1664,7 @@ static int add_debug_attr(void *d, const char *path)
 {
 	struct iio_device *dev = d;
 	const char *attr = strrchr(path, '/') + 1;
-	char **attrs, *name = strdup(attr);
+	char **attrs, *name = iio_strdup(attr);
 	if (!name)
 		return -ENOMEM;
 
@@ -1557,41 +1740,10 @@ static const struct iio_backend_ops local_ops = {
 	.cancel = local_cancel,
 };
 
-static void init_index(struct iio_channel *chn)
-{
-	char buf[1024];
-	long id = -ENOENT;
-
-	if (chn->is_scan_element) {
-		id = (long) local_read_chn_attr(chn, "index", buf, sizeof(buf));
-		if (id > 0)
-			id = atol(buf);
-	}
-	chn->index = id;
-}
-
-static void init_data_format(struct iio_channel *chn)
+static void init_data_scale(struct iio_channel *chn)
 {
 	char buf[1024];
 	ssize_t ret;
-
-	if (chn->is_scan_element) {
-		ret = local_read_chn_attr(chn, "type", buf, sizeof(buf));
-		if (ret < 0) {
-			chn->format.length = 0;
-		} else {
-			char endian, sign;
-
-			sscanf(buf, "%ce:%c%u/%u>>%u", &endian, &sign,
-					&chn->format.bits, &chn->format.length,
-					&chn->format.shift);
-			chn->format.is_signed = (sign == 's' || sign == 'S');
-			chn->format.is_fully_defined =
-					(sign == 'S' || sign == 'U'||
-					chn->format.bits == chn->format.length);
-			chn->format.is_be = endian == 'b';
-		}
-	}
 
 	ret = iio_channel_attr_read(chn, "scale", buf, sizeof(buf));
 	if (ret < 0) {
@@ -1609,13 +1761,66 @@ static void init_scan_elements(struct iio_context *ctx)
 	for (i = 0; i < ctx->nb_devices; i++) {
 		struct iio_device *dev = ctx->devices[i];
 
-		for (j = 0; j < dev->nb_channels; j++) {
-			struct iio_channel *chn = dev->channels[j];
-			init_index(chn);
-			init_data_format(chn);
-		}
+		for (j = 0; j < dev->nb_channels; j++)
+			init_data_scale(dev->channels[j]);
 	}
 }
+
+#ifdef WITH_LOCAL_CONFIG
+static int populate_context_attrs(struct iio_context *ctx, const char *file)
+{
+	struct INI *ini;
+	int ret;
+
+	ini = ini_open(file);
+	if (!ini) {
+		/* INI file not present -> not an error */
+		if (errno == ENOENT)
+			return 0;
+		else
+			return -errno;
+	}
+
+	while (true) {
+		const char *section;
+		size_t len;
+
+		ret = ini_next_section(ini, &section, &len);
+		if (ret <= 0)
+			goto out_close_ini;
+
+		if (!strncmp(section, "Context Attributes", len))
+			break;
+	}
+
+	do {
+		const char *key, *value;
+		char *new_key, *new_val;
+		size_t klen, vlen;
+
+		ret = ini_read_pair(ini, &key, &klen, &value, &vlen);
+		if (ret <= 0)
+			break;
+
+		/* Create a dup of the strings read from the INI, since they are
+		 * not NULL-terminated. */
+		new_key = strndup(key, klen);
+		new_val = strndup(value, vlen);
+
+		if (!new_key || !new_val)
+			ret = -ENOMEM;
+		else
+			ret = iio_context_add_attr(ctx, new_key, new_val);
+
+		free(new_key);
+		free(new_val);
+	} while (!ret);
+
+out_close_ini:
+	ini_close(ini);
+	return ret;
+}
+#endif
 
 struct iio_context * local_create_context(void)
 {
@@ -1647,7 +1852,7 @@ struct iio_context * local_create_context(void)
 		goto err_set_errno;
 	}
 
-	snprintf(ctx->description, len + 5, "%s %s %s %s %s", uts.sysname,
+	iio_snprintf(ctx->description, len + 5, "%s %s %s %s %s", uts.sysname,
 			uts.nodename, uts.release, uts.version, uts.machine);
 
 	ret = foreach_in_dir(ctx, "/sys/bus/iio/devices", true, create_device);
@@ -1657,6 +1862,17 @@ struct iio_context * local_create_context(void)
 	foreach_in_dir(ctx, "/sys/kernel/debug/iio", true, add_debug);
 
 	init_scan_elements(ctx);
+
+#ifdef WITH_LOCAL_CONFIG
+	ret = populate_context_attrs(ctx, "/etc/libiio.ini");
+	if (ret < 0)
+		goto err_context_destroy;
+#endif
+
+	ret = iio_context_add_attr(ctx, "local,kernel", uts.release);
+	if (ret < 0)
+		goto err_context_destroy;
+
 	ret = iio_context_init(ctx);
 	if (ret < 0)
 		goto err_context_destroy;
@@ -1680,19 +1896,32 @@ int local_context_scan(struct iio_scan_result *scan_result)
 {
 	struct iio_context_info **info;
 	bool exists = false;
+	char *desc, *uri;
 	int ret;
 
-	ret = foreach_in_dir(&exists, "/sys/bus/iio/devices",
-			true, check_device);
+	ret = foreach_in_dir(&exists, "/sys/bus/iio", true, check_device);
 	if (ret < 0 || !exists)
 		return 0;
 
-	info = iio_scan_result_add(scan_result, 1);
-	if (!info)
+	desc = iio_strdup("Local devices");
+	if (!desc)
 		return -ENOMEM;
 
-	info[0]->description = "Local devices";
-	info[0]->uri = "local:";
+	uri = iio_strdup("local:");
+	if (!uri)
+		goto err_free_desc;
 
+	info = iio_scan_result_add(scan_result, 1);
+	if (!info)
+		goto err_free_uri;
+
+	info[0]->description = desc;
+	info[0]->uri = uri;
 	return 0;
+
+err_free_uri:
+	free(uri);
+err_free_desc:
+	free(desc);
+	return -ENOMEM;
 }
