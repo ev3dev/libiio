@@ -3,17 +3,22 @@ Section: libs
 Priority: optional
 Maintainer: A. Maitland Bottoms <bottoms@debian.org>
 Build-Depends: bison,
-               cli-common-dev (>= 0.9~),
+	       cli-common-dev [amd64 arm64 armel armhf i386 mipsel ppc64el s390x kfreebsd-any powerpc ppc64],
                cmake (>= 2.8),
                debhelper (>= 9),
                dh-python,
                doxygen,
                flex,
-               libxml2-dev,
+	       libserialport-dev,
+	       libudev-dev [linux-any],
+	       libusb-1.0-0-dev [linux-any],
+	       libusb2-dev [kfreebsd-any],
+	       libxml2-dev,
                python
-Standards-Version: 4.0.0
+Standards-Version: 4.1.0
 Homepage: https://github.com/analogdevicesinc/libiio
-Vcs-Git: https://github.com/analogdevicesinc/libiio.git
+Vcs-Browser: https://anonscm.debian.org/cgit/collab-maint/libiio.git
+Vcs-Git: https://anonscm.debian.org/git/collab-maint/libiio.git
 
 Package: libiio0
 Architecture: any
@@ -31,6 +36,7 @@ Description: Library for interfacing with IIO devices
 Package: libiio-dev
 Section: libdevel
 Architecture: any
+Multi-Arch: same
 Depends: libiio0 (= ${binary:Version}), ${misc:Depends}
 Description: libiio development files
  Libiio is a library that has been conceived to ease the development of
@@ -75,7 +81,7 @@ Description: Python bindings for libiio
 
 Package: libiio0-cil
 Section: cli-mono
-Architecture: any
+Architecture: amd64 arm64 armel armhf i386 mipsel ppc64el s390x kfreebsd-any powerpc ppc64
 Depends: libiio0 (>= ${binary:Version}), ${cli:Depends}, ${misc:Depends}
 Description: CLI bindings for libiio
  Libiio is a library that has been conceived to ease the development of
@@ -86,7 +92,7 @@ Description: CLI bindings for libiio
 
 Package: libiio-cil-dev
 Section: cli-mono
-Architecture: all
+Architecture: amd64 arm64 armel armhf i386 mipsel ppc64el s390x kfreebsd-any powerpc ppc64
 Depends: libiio0-cil (>= ${source:Upstream-Version}),
          libiio0-cil (<< ${source:Upstream-Version}+1~),
          ${misc:Depends}
@@ -101,6 +107,7 @@ Description: CLI bindings for libiio (development)
 Package: libiio0-doc
 Section: doc
 Architecture: all
+Multi-Arch: foreign
 Depends: libjs-jquery, ${misc:Depends}
 Description: libiio documentation
  Libiio is a library that has been conceived to ease the development of
