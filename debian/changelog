@@ -1,3 +1,10 @@
+libiio (0.10-2) unstable; urgency=medium
+
+  * linux-only iiod
+  * Adopt package
+
+ -- A. Maitland Bottoms <bottoms@debian.org>  Tue, 05 Sep 2017 20:34:24 -0400
+
 libiio (0.10-1) unstable; urgency=medium
 
   * New upstream release

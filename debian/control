@@ -1,8 +1,7 @@
 Source: libiio
 Section: libs
 Priority: optional
-Maintainer: Paul Cercueil <paul.cercueil@analog.com>
-Uploaders: A. Maitland Bottoms <bottoms@debian.org>
+Maintainer: A. Maitland Bottoms <bottoms@debian.org>
 Build-Depends: bison,
                cli-common-dev (>= 0.9~),
                cmake (>= 2.8),
@@ -41,7 +40,7 @@ Description: libiio development files
  This package contains the development files.
 
 Package: iiod
-Architecture: any
+Architecture: linux-any
 Depends: libiio0 (>= ${binary:Version}),
          lsb-base (>=3.0-6),
          ${misc:Depends},
