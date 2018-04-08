@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 2.8.7)
 project(libiio C)
 
 set(LIBIIO_VERSION_MAJOR 0)
-set(LIBIIO_VERSION_MINOR 10)
+set(LIBIIO_VERSION_MINOR 14)
 set(VERSION "${LIBIIO_VERSION_MAJOR}.${LIBIIO_VERSION_MINOR}")
 
 # Set the default install path to /usr
@@ -111,7 +111,7 @@ if (GIT_FOUND)
 		OUTPUT_STRIP_TRAILING_WHITESPACE
 	)
 
-	if (${LIBIIO_GIT_REPO} MATCHES ${CMAKE_CURRENT_SOURCE_DIR})
+	if ("${LIBIIO_GIT_REPO}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
 		execute_process(
 			COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
 			WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
@@ -120,6 +120,9 @@ if (GIT_FOUND)
 		)
 	endif()
 endif()
+
+set(LIBIIO_VERSION  ${VERSION}.g${LIBIIO_VERSION_GIT})
+file(WRITE ${CMAKE_BINARY_DIR}/.version ${LIBIIO_VERSION})
 
 if (NOT LIBIIO_VERSION_GIT)
 	set(LIBIIO_VERSION_GIT v${VERSION})
@@ -174,18 +177,19 @@ if (LIBSERIALPORT_LIBRARIES AND LIBSERIALPORT_INCLUDE_DIR)
 		file(STRINGS ${LIBSERIALPORT_INCLUDE_DIR}/libserialport.h LIBSERIALPORT_VERSION_STR REGEX "SP_PACKAGE_VERSION_STRING")
 		string(REGEX REPLACE "#define SP_PACKAGE_VERSION_STRING \"(.*)\"" "\\1" LIBSERIALPORT_VERSION ${LIBSERIALPORT_VERSION_STR})
 		if ("${LIBSERIALPORT_VERSION}" VERSION_LESS 0.1.1)
-			message(SEND_ERROR "The installed version of libserialport is too old. The minimum version supported is 0.1.1.")
+			message(WARNING "The installed version of libserialport is too old. The minimum version supported is 0.1.1. Disabling Serial support.")
+			SET(WITH_SERIAL_BACKEND OFF)
+		else()
+			add_definitions(-DSERIAL_BACKEND=1)
+			set(LIBIIO_CFILES ${LIBIIO_CFILES} serial.c)
+			set(LIBS_TO_LINK ${LIBS_TO_LINK} ${LIBSERIALPORT_LIBRARIES})
+
+			set(NEED_THREADS 1)
+			set(IIOD_CLIENT 1)
+			set(NEED_LIBXML2 1)
+
+			include_directories(${LIBSERIALPORT_INCLUDE_DIR})
 		endif()
-
-		add_definitions(-DSERIAL_BACKEND=1)
-		set(LIBIIO_CFILES ${LIBIIO_CFILES} serial.c)
-		set(LIBS_TO_LINK ${LIBS_TO_LINK} ${LIBSERIALPORT_LIBRARIES})
-
-		set(NEED_THREADS 1)
-		set(IIOD_CLIENT 1)
-		set(NEED_LIBXML2 1)
-
-		include_directories(${LIBSERIALPORT_INCLUDE_DIR})
 	endif()
 endif()
 
