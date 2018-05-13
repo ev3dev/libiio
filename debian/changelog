@@ -1,3 +1,9 @@
+libiio (0.15-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- A. Maitland Bottoms <bottoms@debian.org>  Sun, 13 May 2018 11:00:37 -0400
+
 libiio (0.14-1) unstable; urgency=medium
 
   * New upstream, update to v0.14-15-g8ac1893

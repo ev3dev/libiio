@@ -2,8 +2,11 @@ cmake_minimum_required(VERSION 2.8.7)
 project(libiio C)
 
 set(LIBIIO_VERSION_MAJOR 0)
-set(LIBIIO_VERSION_MINOR 14)
+set(LIBIIO_VERSION_MINOR 15)
 set(VERSION "${LIBIIO_VERSION_MAJOR}.${LIBIIO_VERSION_MINOR}")
+if (WIN32)
+	string(TIMESTAMP BUILD_YEAR "%Y")
+endif()
 
 # Set the default install path to /usr
 if (NOT WIN32 AND CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
@@ -246,7 +249,7 @@ else()
 endif()
 
 if (LIBXML2_FOUND)
-	option(WITH_XML_BACKEND "Enable the serial backend" ON)
+	option(WITH_XML_BACKEND "Enable the XML backend" ON)
 
 	if (WITH_XML_BACKEND)
 		set(LIBIIO_CFILES ${LIBIIO_CFILES} xml.c)
@@ -303,7 +306,13 @@ if(WITH_TESTS)
 	add_subdirectory(tests)
 endif()
 
-add_library(iio ${LIBIIO_CFILES} ${LIBIIO_HEADERS} ${LIBIIO_EXTRA_HEADERS})
+if (WIN32)
+	set(LIBIIO_ORIGINAL_FILENAME libiio.dll)
+	set(LIBIIO_RC ${CMAKE_CURRENT_BINARY_DIR}/properties.rc)
+	configure_file(properties.rc.cmakein ${LIBIIO_RC} @ONLY)
+endif()
+
+add_library(iio ${LIBIIO_CFILES} ${LIBIIO_HEADERS} ${LIBIIO_EXTRA_HEADERS} ${LIBIIO_RC})
 set_target_properties(iio PROPERTIES
 	VERSION ${VERSION}
 	SOVERSION ${LIBIIO_VERSION_MAJOR}
@@ -396,6 +405,15 @@ if(OSX_PACKAGE)
 endif()
 
 if(WITH_IIOD)
+	option(WITH_SYSTEMD "Enable installation of systemd service file for iiod" OFF)
+	set(SYSTEMD_UNIT_INSTALL_DIR /lib/systemd/system CACHE PATH "default install path for systemd unit files")
+
+	option(WITH_SYSVINIT "Enable installation of SysVinit script for iiod" OFF)
+	set(SYSVINIT_INSTALL_DIR /etc/init.d CACHE PATH "default install path for SysVinit scripts")
+
+	option(WITH_UPSTART "Enable installation of upstart config file for iiod" OFF)
+	set(UPSTART_CONF_INSTALL_DIR /etc/init CACHE PATH "default install path for upstart conf files")
+
 	if (NOT PTHREAD_LIBRARIES)
 		message(WARNING "IIOD requires threads support; disabling")
 		set(WITH_IIOD OFF CACHE BOOL "" FORCE)
