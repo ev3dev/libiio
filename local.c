@@ -56,11 +56,11 @@
 
 /* Forward declarations */
 static ssize_t local_read_dev_attr(const struct iio_device *dev,
-		const char *attr, char *dst, size_t len, bool is_debug);
+		const char *attr, char *dst, size_t len, enum iio_attr_type type);
 static ssize_t local_read_chn_attr(const struct iio_channel *chn,
 		const char *attr, char *dst, size_t len);
 static ssize_t local_write_dev_attr(const struct iio_device *dev,
-		const char *attr, const char *src, size_t len, bool is_debug);
+		const char *attr, const char *src, size_t len, enum iio_attr_type type);
 static ssize_t local_write_chn_attr(const struct iio_channel *chn,
 		const char *attr, const char *src, size_t len);
 
@@ -88,7 +88,9 @@ struct iio_context_pdata {
 struct iio_device_pdata {
 	int fd;
 	bool blocking;
-	unsigned int samples_count, nb_blocks;
+	unsigned int samples_count;
+	unsigned int max_nb_blocks;
+	unsigned int allocated_nb_blocks;
 
 	struct block *blocks;
 	void **addrs;
@@ -107,6 +109,11 @@ struct iio_channel_pdata {
 static const char * const device_attrs_blacklist[] = {
 	"dev",
 	"uevent",
+};
+
+static const char * const buffer_attrs_reserved[] = {
+	"length",
+	"enable",
 };
 
 static int ioctl_nointr(int fd, unsigned long request, void *data)
@@ -428,7 +435,7 @@ static int local_set_kernel_buffers_count(const struct iio_device *dev,
 	if (pdata->fd != -1)
 		return -EBUSY;
 
-	pdata->nb_blocks = nb_blocks;
+	pdata->max_nb_blocks = nb_blocks;
 
 	return 0;
 }
@@ -475,6 +482,8 @@ static ssize_t local_get_buffer(const struct iio_device *dev,
 			*addr_ptr = pdata->addrs[pdata->last_dequeued];
 			return (ssize_t) last_block->bytes_used;
 		}
+
+		pdata->last_dequeued = -1;
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &start);
@@ -508,16 +517,34 @@ static ssize_t local_get_buffer(const struct iio_device *dev,
 }
 
 static ssize_t local_read_all_dev_attrs(const struct iio_device *dev,
-		char *dst, size_t len, bool is_debug)
+		char *dst, size_t len, enum iio_attr_type type)
 {
-	unsigned int i, nb = is_debug ? dev->nb_debug_attrs : dev->nb_attrs;
-	char **attrs = is_debug ? dev->debug_attrs : dev->attrs;
+	unsigned int i, nb;
+	char **attrs;
 	char *ptr = dst;
+
+	switch (type) {
+		case IIO_ATTR_TYPE_DEVICE:
+			nb =  dev->nb_attrs;
+			attrs = dev->attrs;
+			break;
+		case IIO_ATTR_TYPE_DEBUG:
+			nb =  dev->nb_debug_attrs;
+			attrs = dev->debug_attrs;
+			break;
+		case IIO_ATTR_TYPE_BUFFER:
+			nb =  dev->nb_buffer_attrs;
+			attrs = dev->buffer_attrs;
+			break;
+		default:
+			return -EINVAL;
+			break;
+	}
 
 	for (i = 0; len >= 4 && i < nb; i++) {
 		/* Recursive! */
 		ssize_t ret = local_read_dev_attr(dev, attrs[i],
-				ptr + 4, len - 4, is_debug);
+				ptr + 4, len - 4, type);
 		*(uint32_t *) ptr = iio_htobe32(ret);
 
 		/* Align the length to 4 bytes */
@@ -581,11 +608,29 @@ static int local_buffer_analyze(unsigned int nb, const char *src, size_t len)
 }
 
 static ssize_t local_write_all_dev_attrs(const struct iio_device *dev,
-		const char *src, size_t len, bool is_debug)
+		const char *src, size_t len, enum iio_attr_type type)
 {
-	unsigned int i, nb = is_debug ? dev->nb_debug_attrs : dev->nb_attrs;
-	char **attrs = is_debug ? dev->debug_attrs : dev->attrs;
+	unsigned int i, nb;
+	char **attrs;
 	const char *ptr = src;
+
+	switch (type) {
+		case IIO_ATTR_TYPE_DEVICE:
+			nb =  dev->nb_attrs;
+			attrs = dev->attrs;
+			break;
+		case IIO_ATTR_TYPE_DEBUG:
+			nb =  dev->nb_debug_attrs;
+			attrs = dev->debug_attrs;
+			break;
+		case IIO_ATTR_TYPE_BUFFER:
+			nb =  dev->nb_buffer_attrs;
+			attrs = dev->buffer_attrs;
+			break;
+		default:
+			return -EINVAL;
+			break;
+	}
 
 	/* First step: Verify that the buffer is in the correct format */
 	if (local_buffer_analyze(nb, src, len))
@@ -597,7 +642,7 @@ static ssize_t local_write_all_dev_attrs(const struct iio_device *dev,
 		ptr += 4;
 
 		if (val > 0) {
-			local_write_dev_attr(dev, attrs[i], ptr, val, is_debug);
+			local_write_dev_attr(dev, attrs[i], ptr, val, type);
 
 			/* Align the length to 4 bytes */
 			if (val & 3)
@@ -638,21 +683,30 @@ static ssize_t local_write_all_chn_attrs(const struct iio_channel *chn,
 }
 
 static ssize_t local_read_dev_attr(const struct iio_device *dev,
-		const char *attr, char *dst, size_t len, bool is_debug)
+		const char *attr, char *dst, size_t len, enum iio_attr_type type)
 {
 	FILE *f;
 	char buf[1024];
 	ssize_t ret;
 
 	if (!attr)
-		return local_read_all_dev_attrs(dev, dst, len, is_debug);
+		return local_read_all_dev_attrs(dev, dst, len, type);
 
-	if (is_debug) {
-		iio_snprintf(buf, sizeof(buf), "/sys/kernel/debug/iio/%s/%s",
-				dev->id, attr);
-	} else {
-		iio_snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
-				dev->id, attr);
+	switch (type) {
+		case IIO_ATTR_TYPE_DEVICE:
+			iio_snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
+					dev->id, attr);
+			break;
+		case IIO_ATTR_TYPE_DEBUG:
+			iio_snprintf(buf, sizeof(buf), "/sys/kernel/debug/iio/%s/%s",
+					dev->id, attr);
+			break;
+		case IIO_ATTR_TYPE_BUFFER:
+			iio_snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/buffer/%s",
+					dev->id, attr);
+			break;
+		default:
+			return -EINVAL;
 	}
 
 	f = fopen(buf, "re");
@@ -670,21 +724,30 @@ static ssize_t local_read_dev_attr(const struct iio_device *dev,
 }
 
 static ssize_t local_write_dev_attr(const struct iio_device *dev,
-		const char *attr, const char *src, size_t len, bool is_debug)
+		const char *attr, const char *src, size_t len, enum iio_attr_type type)
 {
 	FILE *f;
 	char buf[1024];
 	ssize_t ret;
 
 	if (!attr)
-		return local_write_all_dev_attrs(dev, src, len, is_debug);
+		return local_write_all_dev_attrs(dev, src, len, type);
 
-	if (is_debug) {
-		iio_snprintf(buf, sizeof(buf), "/sys/kernel/debug/iio/%s/%s",
-				dev->id, attr);
-	} else {
-		iio_snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
-				dev->id, attr);
+	switch (type) {
+		case IIO_ATTR_TYPE_DEVICE:
+			iio_snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/%s",
+					dev->id, attr);
+			break;
+		case IIO_ATTR_TYPE_DEBUG:
+			iio_snprintf(buf, sizeof(buf), "/sys/kernel/debug/iio/%s/%s",
+					dev->id, attr);
+			break;
+		case IIO_ATTR_TYPE_BUFFER:
+			iio_snprintf(buf, sizeof(buf), "/sys/bus/iio/devices/%s/buffer/%s",
+					dev->id, attr);
+			break;
+		default:
+			return -EINVAL;
 	}
 
 	f = fopen(buf, "we");
@@ -729,9 +792,8 @@ static ssize_t local_write_chn_attr(const struct iio_channel *chn,
 	return local_write_dev_attr(chn->dev, attr, src, len, false);
 }
 
-static int channel_write_state(const struct iio_channel *chn)
+static int channel_write_state(const struct iio_channel *chn, bool en)
 {
-	char *en = iio_channel_is_enabled(chn) ? "1" : "0";
 	ssize_t ret;
 
 	if (!chn->pdata->enable_fn) {
@@ -739,7 +801,7 @@ static int channel_write_state(const struct iio_channel *chn)
 		return -EINVAL;
 	}
 
-	ret = local_write_chn_attr(chn, chn->pdata->enable_fn, en, 2);
+	ret = local_write_chn_attr(chn, chn->pdata->enable_fn, en ? "1" : "0", 2);
 	if (ret < 0)
 		return (int) ret;
 	else
@@ -750,23 +812,24 @@ static int enable_high_speed(const struct iio_device *dev)
 {
 	struct block_alloc_req req;
 	struct iio_device_pdata *pdata = dev->pdata;
+	unsigned int nb_blocks;
 	unsigned int i;
 	int ret, fd = pdata->fd;
 
+
 	if (pdata->cyclic) {
-		pdata->nb_blocks = 1;
+		nb_blocks = 1;
 		DEBUG("Enabling cyclic mode\n");
 	} else {
+		nb_blocks = pdata->max_nb_blocks;
 		DEBUG("Cyclic mode not enabled\n");
 	}
 
-	pdata->blocks = calloc(pdata->nb_blocks, sizeof(*pdata->blocks));
-	if (!pdata->blocks) {
-		pdata->nb_blocks = 0;
+	pdata->blocks = calloc(nb_blocks, sizeof(*pdata->blocks));
+	if (!pdata->blocks)
 		return -ENOMEM;
-	}
 
-	pdata->addrs = calloc(pdata->nb_blocks, sizeof(*pdata->addrs));
+	pdata->addrs = calloc(nb_blocks, sizeof(*pdata->addrs));
 	if (!pdata->addrs) {
 		free(pdata->blocks);
 		pdata->blocks = NULL;
@@ -777,7 +840,7 @@ static int enable_high_speed(const struct iio_device *dev)
 	req.type = 0;
 	req.size = pdata->samples_count *
 		iio_device_get_sample_size_mask(dev, dev->mask, dev->words);
-	req.count = pdata->nb_blocks;
+	req.count = nb_blocks;
 
 	ret = ioctl_nointr(fd, BLOCK_ALLOC_IOCTL, &req);
 	if (ret < 0) {
@@ -785,11 +848,16 @@ static int enable_high_speed(const struct iio_device *dev)
 		goto err_freemem;
 	}
 
+	if (req.count == 0) {
+		ret = -ENOMEM;
+		goto err_block_free;
+	}
+
 	/* We might get less blocks than what we asked for */
-	pdata->nb_blocks = req.count;
+	pdata->allocated_nb_blocks = req.count;
 
 	/* mmap all the blocks */
-	for (i = 0; i < pdata->nb_blocks; i++) {
+	for (i = 0; i < pdata->allocated_nb_blocks; i++) {
 		pdata->blocks[i].id = i;
 		ret = ioctl_nointr(fd, BLOCK_QUERY_IOCTL, &pdata->blocks[i]);
 		if (ret) {
@@ -818,7 +886,9 @@ static int enable_high_speed(const struct iio_device *dev)
 err_munmap:
 	for (; i > 0; i--)
 		munmap(pdata->addrs[i - 1], pdata->blocks[i - 1].size);
+err_block_free:
 	ioctl_nointr(fd, BLOCK_FREE_IOCTL, 0);
+	pdata->allocated_nb_blocks = 0;
 err_freemem:
 	free(pdata->addrs);
 	pdata->addrs = NULL;
@@ -863,7 +933,7 @@ static int local_open(const struct iio_device *dev,
 	for (i = 0; i < dev->nb_channels; i++) {
 		struct iio_channel *chn = dev->channels[i];
 		if (chn->index >= 0 && !iio_channel_is_enabled(chn)) {
-			ret = channel_write_state(chn);
+			ret = channel_write_state(chn, false);
 			if (ret < 0)
 				goto err_close;
 		}
@@ -872,7 +942,7 @@ static int local_open(const struct iio_device *dev,
 	for (i = 0; i < dev->nb_channels; i++) {
 		struct iio_channel *chn = dev->channels[i];
 		if (chn->index >= 0 && iio_channel_is_enabled(chn)) {
-			ret = channel_write_state(chn);
+			ret = channel_write_state(chn, true);
 			if (ret < 0)
 				goto err_close;
 		}
@@ -882,10 +952,15 @@ static int local_open(const struct iio_device *dev,
 	pdata->cyclic_buffer_enqueued = false;
 	pdata->buffer_enabled = false;
 	pdata->samples_count = samples_count;
-	pdata->is_high_speed = !enable_high_speed(dev);
+
+	ret = enable_high_speed(dev);
+	if (ret < 0 && ret != -ENOSYS)
+		goto err_close;
+
+	pdata->is_high_speed = !ret;
 
 	if (!pdata->is_high_speed) {
-		unsigned long size = samples_count * pdata->nb_blocks;
+		unsigned long size = samples_count * pdata->max_nb_blocks;
 		WARNING("High-speed mode not enabled\n");
 
 		/* Cyclic mode is only supported in high-speed mode */
@@ -929,9 +1004,10 @@ static int local_close(const struct iio_device *dev)
 
 	if (pdata->is_high_speed) {
 		unsigned int i;
-		for (i = 0; i < pdata->nb_blocks; i++)
+		for (i = 0; i < pdata->allocated_nb_blocks; i++)
 			munmap(pdata->addrs[i], pdata->blocks[i].size);
 		ioctl_nointr(pdata->fd, BLOCK_FREE_IOCTL, 0);
+		pdata->allocated_nb_blocks = 0;
 		free(pdata->addrs);
 		pdata->addrs = NULL;
 		free(pdata->blocks);
@@ -952,10 +1028,8 @@ static int local_close(const struct iio_device *dev)
 	for (i = 0; i < dev->nb_channels; i++) {
 		struct iio_channel *chn = dev->channels[i];
 
-		if (chn->pdata->enable_fn) {
-			iio_channel_disable(chn);
-			channel_write_state(chn);
-		}
+		if (chn->pdata->enable_fn)
+			channel_write_state(chn, false);
 	}
 
 	return (ret < 0) ? ret : 0;
@@ -1491,6 +1565,33 @@ static int detect_and_move_global_attrs(struct iio_device *dev)
 	return 0;
 }
 
+static int add_buffer_attr(void *d, const char *path)
+{
+	struct iio_device *dev = (struct iio_device *) d;
+	const char *name = strrchr(path, '/') + 1;
+	char **attrs, *attr;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(buffer_attrs_reserved); i++)
+		if (!strcmp(buffer_attrs_reserved[i], name))
+			return 0;
+
+	attr = iio_strdup(name);
+	if (!attr)
+		return -ENOMEM;
+
+	attrs = realloc(dev->buffer_attrs, (1 + dev->nb_buffer_attrs) * sizeof(char *));
+	if (!attrs) {
+		free(attr);
+		return -ENOMEM;
+	}
+
+	attrs[dev->nb_buffer_attrs++] = attr;
+	dev->buffer_attrs = attrs;
+	DEBUG("Added buffer attr \'%s\' to device \'%s\'\n", attr, dev->id);
+	return 0;
+}
+
 static int add_attr_or_channel_helper(struct iio_device *dev,
 		const char *path, bool dir_is_scan_elements)
 {
@@ -1586,6 +1687,22 @@ static int add_scan_elements(struct iio_device *dev, const char *devpath)
 	return 0;
 }
 
+static int add_buffer_attributes(struct iio_device *dev, const char *devpath)
+{
+	struct stat st;
+	char buf[1024];
+
+	iio_snprintf(buf, sizeof(buf), "%s/buffer", devpath);
+
+	if (!stat(buf, &st) && S_ISDIR(st.st_mode)) {
+		int ret = foreach_in_dir(dev, buf, false, add_buffer_attr);
+		if (ret < 0)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int create_device(void *d, const char *path)
 {
 	uint32_t *mask = NULL;
@@ -1604,7 +1721,7 @@ static int create_device(void *d, const char *path)
 
 	dev->pdata->fd = -1;
 	dev->pdata->blocking = true;
-	dev->pdata->nb_blocks = NB_BLOCKS;
+	dev->pdata->max_nb_blocks = NB_BLOCKS;
 
 	dev->ctx = ctx;
 	dev->id = iio_strdup(strrchr(path, '/') + 1);
@@ -1618,6 +1735,10 @@ static int create_device(void *d, const char *path)
 	if (ret < 0)
 		goto err_free_device;
 
+	ret = add_buffer_attributes(dev, path);
+	if (ret < 0)
+		goto err_free_device;
+	
 	ret = add_scan_elements(dev, path);
 	if (ret < 0)
 		goto err_free_scan_elements;

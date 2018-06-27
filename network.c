@@ -43,7 +43,7 @@
 #include <netinet/tcp.h>
 #include <net/if.h>
 #include <sys/mman.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif /* _WIN32 */
@@ -408,9 +408,11 @@ static void __avahi_browser_cb(AvahiServiceBrowser *browser,
 				nanosleep(&ts, NULL);
 			}
 		}
-	case AVAHI_BROWSER_FAILURE: /* fall-through */
+		/* fall-through */
+	case AVAHI_BROWSER_FAILURE:
 		avahi_simple_poll_quit(ddata->poll);
-	case AVAHI_BROWSER_CACHE_EXHAUSTED: /* fall-through */
+		/* fall-through */
+	case AVAHI_BROWSER_CACHE_EXHAUSTED:
 		break;
 	}
 }
@@ -629,11 +631,15 @@ static int set_socket_timeout(int fd, unsigned int timeout)
 static int do_connect(int fd, const struct addrinfo *addrinfo,
 	unsigned int timeout)
 {
-	struct timeval tv;
-	struct timeval *ptv;
 	int ret, error;
 	socklen_t len;
+#ifdef _WIN32
+	struct timeval tv;
+	struct timeval *ptv;
 	fd_set set;
+#else
+	struct pollfd pfd;
+#endif
 
 	ret = set_blocking_mode(fd, false);
 	if (ret < 0)
@@ -646,6 +652,7 @@ static int do_connect(int fd, const struct addrinfo *addrinfo,
 			return ret;
 	}
 
+#ifdef _WIN32
 	FD_ZERO(&set);
 	FD_SET(fd, &set);
 
@@ -658,6 +665,16 @@ static int do_connect(int fd, const struct addrinfo *addrinfo,
 	}
 
 	ret = select(fd + 1, NULL, &set, &set, ptv);
+#else
+	pfd.fd = fd;
+	pfd.events = POLLOUT | POLLERR;
+	pfd.revents = 0;
+
+	do {
+		ret = poll(&pfd, 1, timeout);
+	} while (ret == -1 && errno == EINTR);
+#endif
+
 	if (ret < 0)
 		return network_get_error();
 
@@ -722,6 +739,7 @@ static int network_open(const struct iio_device *dev,
 
 	ppdata->io_ctx.fd = ret;
 	ppdata->io_ctx.cancelled = false;
+	ppdata->io_ctx.cancellable = false;
 	ppdata->io_ctx.timeout_ms = DEFAULT_TIMEOUT_MS;
 
 	ret = iiod_client_open_unlocked(pdata->iiod_client,
@@ -1129,21 +1147,21 @@ err_unlock:
 #endif
 
 static ssize_t network_read_dev_attr(const struct iio_device *dev,
-		const char *attr, char *dst, size_t len, bool is_debug)
+		const char *attr, char *dst, size_t len, enum iio_attr_type type)
 {
 	struct iio_context_pdata *pdata = dev->ctx->pdata;
 
 	return iiod_client_read_attr(pdata->iiod_client,
-			&pdata->io_ctx, dev, NULL, attr, dst, len, is_debug);
+			&pdata->io_ctx, dev, NULL, attr, dst, len, type);
 }
 
 static ssize_t network_write_dev_attr(const struct iio_device *dev,
-		const char *attr, const char *src, size_t len, bool is_debug)
+		const char *attr, const char *src, size_t len, enum iio_attr_type type)
 {
 	struct iio_context_pdata *pdata = dev->ctx->pdata;
 
 	return iiod_client_write_attr(pdata->iiod_client,
-			&pdata->io_ctx, dev, NULL, attr, src, len, is_debug);
+			&pdata->io_ctx, dev, NULL, attr, src, len, type);
 }
 
 static ssize_t network_read_chn_attr(const struct iio_channel *chn,
