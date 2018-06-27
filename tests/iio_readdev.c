@@ -30,7 +30,7 @@
 static const struct option options[] = {
 	  {"help", no_argument, 0, 'h'},
 	  {"network", required_argument, 0, 'n'},
-	  {"usb", required_argument, 0, 'u'},
+	  {"uri", required_argument, 0, 'u'},
 	  {"trigger", required_argument, 0, 't'},
 	  {"buffer-size", required_argument, 0, 'b'},
 	  {"samples", required_argument, 0, 's' },
@@ -40,7 +40,7 @@ static const struct option options[] = {
 static const char *options_descriptions[] = {
 	"Show this help and quit.",
 	"Use the network backend with the provided hostname.",
-	"Use the USB backend with the device that matches the given VID/PID.",
+	"Use the context with the provided URI.",
 	"Use the specified trigger.",
 	"Size of the capture buffer. Default is 256.",
 	"Number of samples to capture, 0 = infinite. Default is 0."
@@ -50,8 +50,8 @@ static void usage(void)
 {
 	unsigned int i;
 
-	printf("Usage:\n\t" MY_NAME " [-n <hostname>] [-u <vid>:<pid>] "
-			"[-t <trigger>] [-b <buffer-size>] [-s <samples>] "
+	printf("Usage:\n\t" MY_NAME " [-n <hostname>] [-t <trigger>] "
+			"[-b <buffer-size>] [-s <samples>] "
 			"<iio_device> [<channel> ...]\n\nOptions:\n");
 	for (i = 0; options[i].name; i++)
 		printf("\t-%c, --%s\n\t\t\t%s\n",
@@ -127,7 +127,7 @@ int main(int argc, char **argv)
 {
 	unsigned int i, nb_channels;
 	unsigned int buffer_size = SAMPLES_PER_READ;
-	int c, option_index = 0, arg_index = 0, ip_index = 0, device_index = 0;
+	int c, option_index = 0, arg_index = 0, ip_index = 0, uri_index = 0;
 	struct iio_device *dev;
 	size_t sample_size;
 
@@ -143,7 +143,7 @@ int main(int argc, char **argv)
 			break;
 		case 'u':
 			arg_index += 2;
-			device_index = arg_index;
+			uri_index = arg_index;
 			break;
 		case 't':
 			arg_index += 2;
@@ -168,30 +168,12 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	if (ip_index) {
+	if (uri_index)
+		ctx = iio_create_context_from_uri(argv[uri_index]);
+	else if (ip_index)
 		ctx = iio_create_network_context(argv[ip_index]);
-	} else if (device_index) {
-		char *ptr = argv[device_index], *end;
-		long vid, pid;
-
-		vid = strtol(ptr, &end, 0);
-		if (ptr == end || *end != ':') {
-			fprintf(stderr, "Invalid VID/PID\n");
-			return EXIT_FAILURE;
-		}
-
-		ptr = end + 1;
-		pid = strtol(ptr, &end, 0);
-		if (ptr == end) {
-			fprintf(stderr, "Invalid VID/PID\n");
-			return EXIT_FAILURE;
-		}
-
-		ctx = iio_create_usb_context(
-				(unsigned short) vid, (unsigned short) pid);
-	} else {
+	else
 		ctx = iio_create_default_context();
-	}
 
 	if (!ctx) {
 		fprintf(stderr, "Unable to create IIO context\n");
@@ -201,6 +183,7 @@ int main(int argc, char **argv)
 
 #ifndef _WIN32
 	set_handler(SIGHUP, &quit_all);
+	set_handler(SIGPIPE, &quit_all);
 #endif
 	set_handler(SIGINT, &quit_all);
 	set_handler(SIGSEGV, &quit_all);
@@ -247,7 +230,7 @@ int main(int argc, char **argv)
 		for (i = 0; i < nb_channels; i++) {
 			unsigned int j;
 			struct iio_channel *ch = iio_device_get_channel(dev, i);
-			for (j = arg_index + 2; j < argc; j++) {
+			for (j = arg_index + 2; j < (unsigned int) argc; j++) {
 				const char *n = iio_channel_get_name(ch);
 				if (!strcmp(argv[j], iio_channel_get_id(ch)) ||
 						(n && !strcmp(n, argv[j])))
@@ -268,8 +251,10 @@ int main(int argc, char **argv)
 	while (app_running) {
 		int ret = iio_buffer_refill(buffer);
 		if (ret < 0) {
-			fprintf(stderr, "Unable to refill buffer: %s\n",
-					strerror(-ret));
+			char buf[256];
+
+			iio_strerror(-ret, buf, sizeof(buf));
+			fprintf(stderr, "Unable to refill buffer: %s\n", buf);
 			break;
 		}
 
@@ -287,7 +272,11 @@ int main(int argc, char **argv)
 			for (read_len = len; len; ) {
 				ssize_t nb = fwrite(start, 1, len, stdout);
 				if (nb < 0) {
-					fprintf(stderr, "Unable to write data!\n");
+					char buf[256];
+
+					iio_strerror(-nb, buf, sizeof(buf));
+					fprintf(stderr, "Unable to write data: %s\n",
+							buf);
 					goto err_destroy_buffer;
 				}
 

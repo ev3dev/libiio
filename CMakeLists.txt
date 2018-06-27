@@ -37,16 +37,19 @@ endif()
 set(BUILD_SHARED_LIBS ON CACHE BOOL "Build shared libraries")
 
 option(WITH_NETWORK_BACKEND "Enable the network backend" ON)
+option(WITH_TESTS "Build the test programs" ON)
 
-if (NOT MSVC)
-	option(WITH_TESTS "Build the test programs" ON)
-else()
+if (MSVC)
 	# Avoid annoying warnings from Visual Studio
 	add_definitions(-D_CRT_SECURE_NO_WARNINGS=1)
 endif()
 
 if (NOT WIN32)
 	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fvisibility=hidden")
+endif()
+
+if (CMAKE_COMPILER_IS_GNUCC)
+	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Wno-unused-parameter -Wno-sign-compare")
 endif()
 
 IF(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
@@ -74,13 +77,13 @@ endif()
 set(LIBIIO_CFILES channel.c device.c context.c buffer.c utilities.c)
 set(LIBIIO_HEADERS iio.h)
 
-add_definitions(-D_POSIX_C_SOURCE=200809L -DLIBIIO_EXPORTS=1)
+add_definitions(-D_POSIX_C_SOURCE=200809L -D__XSI_VISIBLE=500 -DLIBIIO_EXPORTS=1)
 
 # Get the GIT hash of the latest commit
 include(FindGit OPTIONAL)
 if (GIT_FOUND)
 	execute_process(
-		COMMAND git rev-parse --show-toplevel
+		COMMAND ${GIT_EXECUTABLE} rev-parse --show-toplevel
 		WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 		OUTPUT_VARIABLE LIBIIO_GIT_REPO
 		OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -88,7 +91,7 @@ if (GIT_FOUND)
 
 	if (${LIBIIO_GIT_REPO} MATCHES ${CMAKE_CURRENT_SOURCE_DIR})
 		execute_process(
-			COMMAND git rev-parse --short HEAD
+			COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
 			WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 			OUTPUT_VARIABLE LIBIIO_VERSION_GIT
 			OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -125,6 +128,22 @@ if (LIBUSB_LIBRARIES AND LIBUSB_INCLUDE_DIR)
 	endif()
 endif()
 
+find_library(LIBSERIALPORT_LIBRARIES serialport)
+find_path(LIBSERIALPORT_INCLUDE_DIR libserialport.h)
+if (LIBSERIALPORT_LIBRARIES AND LIBSERIALPORT_INCLUDE_DIR)
+	option(WITH_SERIAL_BACKEND "Enable the serial backend" ON)
+
+	if (WITH_SERIAL_BACKEND)
+		add_definitions(-DSERIAL_BACKEND=1)
+		set(LIBIIO_CFILES ${LIBIIO_CFILES} serial.c)
+		set(LIBS_TO_LINK ${LIBS_TO_LINK} ${LIBSERIALPORT_LIBRARIES})
+		set(IIOD_CLIENT 1)
+		set(NEED_LIBXML2 1)
+
+		include_directories(${LIBSERIALPORT_INCLUDE_DIR})
+	endif()
+endif()
+
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 if(WITH_NETWORK_BACKEND)
@@ -158,17 +177,20 @@ if(WITH_NETWORK_BACKEND)
 	set(NEED_LIBXML2 1)
 endif()
 
-if (NEED_LIBXML2)
-	include(FindLibXml2)
+include(FindLibXml2)
+if (LIBXML2_FOUND)
+	option(WITH_XML_BACKEND "Enable the serial backend" ON)
 
-	if (NOT LIBXML2_FOUND)
-		message(SEND_ERROR "The selected backends require libxml2 to be installed")
-	else()
+	if (WITH_XML_BACKEND)
 		set(LIBIIO_CFILES ${LIBIIO_CFILES} xml.c)
 		add_definitions(${LIBXML2_DEFINITIONS} -DXML_BACKEND=1)
 		include_directories(${LIBXML2_INCLUDE_DIR})
 		set(LIBS_TO_LINK ${LIBS_TO_LINK} ${LIBXML2_LIBRARIES})
 	endif()
+endif()
+
+if (NEED_LIBXML2 AND NOT (LIBXML2_FOUND AND WITH_XML_BACKEND))
+	message(SEND_ERROR "The selected backends require libxml2 and the XML backend to be enabled")
 endif()
 
 if (NEED_THREADS)
@@ -200,7 +222,15 @@ install(FILES ${LIBIIO_PC} DESTINATION "${INSTALL_PKGCONFIG_DIR}")
 #configure_file(python/setup.py.in ${SETUP_PY} @ONLY)
 
 add_library(iio ${LIBIIO_CFILES} ${LIBIIO_HEADERS})
-set_target_properties(iio PROPERTIES VERSION ${VERSION} SOVERSION ${LIBIIO_VERSION_MAJOR} FRAMEWORK TRUE PUBLIC_HEADER ${LIBIIO_HEADERS})
+set_target_properties(iio PROPERTIES
+	VERSION ${VERSION}
+	SOVERSION ${LIBIIO_VERSION_MAJOR}
+	FRAMEWORK TRUE
+	PUBLIC_HEADER ${LIBIIO_HEADERS}
+	C_STANDARD 99
+	C_STANDARD_REQUIRED ON
+	C_EXTENSIONS OFF
+)
 target_link_libraries(iio LINK_PRIVATE ${LIBS_TO_LINK})
 
 if (MSVC)

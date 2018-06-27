@@ -82,6 +82,18 @@ struct iio_device_pdata {
 	struct iio_mutex *lock;
 };
 
+#ifdef _WIN32
+static int network_get_error(void)
+{
+	return -WSAGetLastError();
+}
+#else
+static int network_get_error(void)
+{
+	return -errno;
+}
+#endif
+
 #ifdef HAVE_AVAHI
 struct avahi_discovery_data {
 	AvahiSimplePoll *poll;
@@ -187,76 +199,56 @@ err_free_poll:
 }
 #endif /* HAVE_AVAHI */
 
+static ssize_t network_recv(int fd, void *data, size_t len, int flags)
+{
+	ssize_t ret;
+	int err;
+
+	while (1) {
+		ret = recv(fd, data, (int) len, flags);
+		if (ret == 0)
+			return -EPIPE;
+		else if (ret > 0)
+			break;
+
+		err = network_get_error();
+		if (err != -EINTR)
+			return (ssize_t) err;
+	}
+	return ret;
+}
+
+static ssize_t network_send(int fd, const void *data, size_t len, int flags)
+{
+	ssize_t ret;
+	int err;
+
+	while (1) {
+		ret = send(fd, data, (int) len, flags);
+		if (ret == 0)
+			return -EPIPE;
+		else if (ret > 0)
+			break;
+
+		err = network_get_error();
+		if (err != -EINTR)
+			return (ssize_t) err;
+	}
+
+	return ret;
+}
+
 static ssize_t write_all(const void *src, size_t len, int fd)
 {
 	uintptr_t ptr = (uintptr_t) src;
 	while (len) {
-		ssize_t ret = send(fd, (const void *) ptr, (int) len, 0);
-		if (ret < 0) {
-#ifdef _WIN32
-			int err = WSAGetLastError();
-#else
-			int err = errno;
-#endif
-			if (err == EINTR)
-				continue;
-			return (ssize_t) -err;
-		}
+		ssize_t ret = network_send(fd, (const void *) ptr, len, 0);
+		if (ret < 0)
+			return ret;
 		ptr += ret;
 		len -= ret;
 	}
 	return (ssize_t)(ptr - (uintptr_t) src);
-}
-
-static ssize_t read_all(void *dst, size_t len, int fd)
-{
-	uintptr_t ptr = (uintptr_t) dst;
-	while (len) {
-		ssize_t ret = recv(fd, (void *) ptr, (int) len, 0);
-		if (ret < 0) {
-#ifdef _WIN32
-			int err = WSAGetLastError();
-#else
-			int err = errno;
-#endif
-			if (err == EINTR)
-				continue;
-			return (ssize_t) -err;
-		}
-		if (ret == 0)
-			return -EPIPE;
-		ptr += ret;
-		len -= ret;
-	}
-	return (ssize_t)(ptr - (uintptr_t) dst);
-}
-
-static int read_integer(int fd, long *val)
-{
-	unsigned int i;
-	char buf[1024], *ptr;
-	ssize_t ret;
-	bool found = false;
-
-	for (i = 0; i < sizeof(buf) - 1; i++) {
-		ret = read_all(buf + i, 1, fd);
-		if (ret < 0)
-			return (int) ret;
-
-		/* Skip the eventual first few carriage returns.
-		 * Also stop when a dot is found (for parsing floats) */
-		if (buf[i] != '\n' && buf[i] != '.')
-			found = true;
-		else if (found)
-			break;
-	}
-
-	buf[i] = '\0';
-	ret = (ssize_t) strtol(buf, &ptr, 10);
-	if (ptr == buf)
-		return -EINVAL;
-	*val = (long) ret;
-	return 0;
 }
 
 static ssize_t write_command(const char *cmd, int fd)
@@ -273,51 +265,37 @@ static ssize_t write_command(const char *cmd, int fd)
 	return ret;
 }
 
-static long exec_command(const char *cmd, int fd)
-{
-	long resp;
-	ssize_t ret = write_command(cmd, fd);
-	if (ret < 0)
-		return (long) ret;
+#ifndef _WIN32
 
-	DEBUG("Reading response\n");
-	ret = read_integer(fd, &resp);
-	if (ret < 0) {
-		char buf[1024];
-		iio_strerror(-ret, buf, sizeof(buf));
-		ERROR("Unable to read response: %s\n", buf);
-		return (long) ret;
-	}
-
-#if LOG_LEVEL >= DEBUG_L
-	if (resp < 0) {
-		char buf[1024];
-		iio_strerror(-resp, buf, sizeof(buf));
-		DEBUG("Server returned an error: %s\n", buf);
-	}
+/* Use it if available */
+#ifndef SOCK_CLOSEXEC
+#define SOCK_CLOSEXEC 0
 #endif
 
-	return resp;
-}
-
-#ifndef _WIN32
 /* The purpose of this function is to provide a version of connect()
  * that does not ignore timeouts... */
-static int do_connect(int fd, const struct sockaddr *addr,
-		socklen_t addrlen, struct timeval *timeout)
+static int do_connect(const struct addrinfo *addrinfo,
+	struct timeval *timeout)
 {
 	int ret, error;
 	socklen_t len;
 	fd_set set;
+	int fd;
+
+	fd = socket(addrinfo->ai_family, addrinfo->ai_socktype | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return -errno;
 
 	FD_ZERO(&set);
 	FD_SET(fd, &set);
 
 	ret = set_blocking_mode(fd, false);
-	if (ret < 0)
+	if (ret < 0) {
+		close(fd);
 		return ret;
+	}
 
-	ret = connect(fd, addr, addrlen);
+	ret = connect(fd, addrinfo->ai_addr, addrinfo->ai_addrlen);
 	if (ret < 0 && errno != EINPROGRESS) {
 		ret = -errno;
 		goto end;
@@ -348,7 +326,12 @@ static int do_connect(int fd, const struct sockaddr *addr,
 end:
 	/* Restore blocking mode */
 	set_blocking_mode(fd, true);
-	return ret;
+	if (ret < 0) {
+		close(fd);
+		return ret;
+	}
+
+	return fd;
 }
 
 static int set_socket_timeout(int fd, unsigned int timeout)
@@ -365,6 +348,32 @@ static int set_socket_timeout(int fd, unsigned int timeout)
 		return 0;
 }
 #else
+
+/* Use it if available */
+#ifndef WSA_FLAG_NO_HANDLE_INHERIT
+#define WSA_FLAG_NO_HANDLE_INHERIT 0
+#endif
+
+static int do_connect(const struct addrinfo *addrinfo,
+	struct timeval *timeout)
+{
+	int ret;
+	SOCKET s;
+
+	s = WSASocketW(addrinfo->ai_family, addrinfo->ai_socktype, 0, NULL, 0,
+		WSA_FLAG_NO_HANDLE_INHERIT);
+	if (s == INVALID_SOCKET)
+		return -WSAGetLastError();
+
+	ret = connect(s, addrinfo->ai_addr, (int) addrinfo->ai_addrlen);
+	if (ret == SOCKET_ERROR) {
+		close(s);
+		return -WSAGetLastError();
+	}
+
+	return (int) s;
+}
+
 static int set_socket_timeout(int fd, unsigned int timeout)
 {
 	if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
@@ -380,35 +389,14 @@ static int set_socket_timeout(int fd, unsigned int timeout)
 static int create_socket(const struct addrinfo *addrinfo)
 {
 	struct timeval timeout;
-	int ret, fd, yes = 1;
-
-#ifdef _WIN32
-	SOCKET s = socket(addrinfo->ai_family, addrinfo->ai_socktype, 0);
-	fd = (s == INVALID_SOCKET) ? -1 : (int) s;
-	if (fd < 0)
-		return -WSAGetLastError();
-#else
-	fd = socket(addrinfo->ai_family, addrinfo->ai_socktype, 0);
-	if (fd < 0)
-		return -errno;
-#endif
+	int fd, yes = 1;
 
 	timeout.tv_sec = DEFAULT_TIMEOUT_MS / 1000;
 	timeout.tv_usec = (DEFAULT_TIMEOUT_MS % 1000) * 1000;
 
-#ifndef _WIN32
-	ret = do_connect(fd, addrinfo->ai_addr, addrinfo->ai_addrlen, &timeout);
-	if (ret < 0)
-		ret = -errno;
-#else
-	ret = connect(fd, addrinfo->ai_addr, (int) addrinfo->ai_addrlen);
-	if (ret == SOCKET_ERROR)
-		ret = -WSAGetLastError();
-#endif
-	if (ret < 0) {
-		close(fd);
-		return ret;
-	}
+	fd = do_connect(addrinfo, &timeout);
+	if (fd < 0)
+		return fd;
 
 	set_socket_timeout(fd, DEFAULT_TIMEOUT_MS);
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
@@ -453,53 +441,6 @@ out_mutex_unlock:
 	return ret;
 }
 
-static ssize_t read_error_code(int fd)
-{
-	/*
-	 * The server returns two integer codes.
-	 * The first one is returned right after the WRITEBUF command is issued,
-	 * and corresponds to the error code returned when the server attempted
-	 * to open the device.
-	 * If zero, a second error code is returned, that corresponds (if positive)
-	 * to the number of bytes written.
-	 *
-	 * To speed up things, we delay error reporting. We just send out the
-	 * data without reading the error code that the server gives us, because
-	 * the answer will take too much time. If an error occured, it will be
-	 * reported by the next call to iio_buffer_push().
-	 */
-
-	unsigned int i;
-	long resp = 0;
-
-	for (i = 0; i < 2; i++) {
-		ssize_t ret = read_integer(fd, &resp);
-		if (ret < 0)
-			return ret;
-		if (resp < 0)
-			return (ssize_t) resp;
-	}
-
-	return (ssize_t) resp;
-}
-
-static ssize_t write_rwbuf_command(const struct iio_device *dev,
-		const char *cmd, bool do_exec)
-{
-	struct iio_device_pdata *pdata = dev->pdata;
-	int fd = pdata->fd;
-
-	if (pdata->wait_for_err_code) {
-		ssize_t ret = read_error_code(fd);
-
-		pdata->wait_for_err_code = false;
-		if (ret < 0)
-			return ret;
-	}
-
-	return do_exec ? exec_command(cmd, fd) : write_command(cmd, fd);
-}
-
 static int network_close(const struct iio_device *dev)
 {
 	struct iio_device_pdata *pdata = dev->pdata;
@@ -532,42 +473,6 @@ static int network_close(const struct iio_device *dev)
 	return ret;
 }
 
-static ssize_t network_read_mask(int fd, uint32_t *mask, size_t words)
-{
-	long read_len;
-	ssize_t ret;
-
-	ret = read_integer(fd, &read_len);
-	if (ret < 0)
-		return ret;
-
-	if (read_len > 0 && mask) {
-		size_t i;
-		char buf[9];
-
-		buf[8] = '\0';
-		DEBUG("Reading mask\n");
-
-		for (i = words; i > 0; i--) {
-			ret = read_all(buf, 8, fd);
-			if (ret < 0)
-				return ret;
-
-			sscanf(buf, "%08x", &mask[i - 1]);
-			DEBUG("mask[%i] = 0x%x\n", i - 1, mask[i - 1]);
-		}
-	}
-
-	if (read_len > 0) {
-		char c;
-		ssize_t nb = read_all(&c, 1, fd);
-		if (nb > 0 && c != '\n')
-			read_len = -EIO;
-	}
-
-	return (ssize_t) read_len;
-}
-
 static ssize_t network_read(const struct iio_device *dev, void *dst, size_t len,
 		uint32_t *mask, size_t words)
 {
@@ -597,12 +502,138 @@ static ssize_t network_write(const struct iio_device *dev,
 }
 
 #ifdef WITH_NETWORK_GET_BUFFER
+
+static ssize_t read_all(void *dst, size_t len, int fd)
+{
+	uintptr_t ptr = (uintptr_t) dst;
+	while (len) {
+		ssize_t ret = network_recv(fd, (void *) ptr, len, 0);
+		if (ret < 0)
+			return ret;
+		ptr += ret;
+		len -= ret;
+	}
+	return (ssize_t)(ptr - (uintptr_t) dst);
+}
+
+static int read_integer(int fd, long *val)
+{
+	unsigned int i;
+	char buf[1024], *ptr;
+	ssize_t ret;
+	bool found = false;
+
+	for (i = 0; i < sizeof(buf) - 1; i++) {
+		ret = read_all(buf + i, 1, fd);
+		if (ret < 0)
+			return (int) ret;
+
+		/* Skip the eventual first few carriage returns.
+		 * Also stop when a dot is found (for parsing floats) */
+		if (buf[i] != '\n' && buf[i] != '.')
+			found = true;
+		else if (found)
+			break;
+	}
+
+	buf[i] = '\0';
+	ret = (ssize_t) strtol(buf, &ptr, 10);
+	if (ptr == buf)
+		return -EINVAL;
+	*val = (long) ret;
+	return 0;
+}
+
+static ssize_t network_read_mask(int fd, uint32_t *mask, size_t words)
+{
+	long read_len;
+	ssize_t ret;
+
+	ret = read_integer(fd, &read_len);
+	if (ret < 0)
+		return ret;
+
+	if (read_len > 0 && mask) {
+		size_t i;
+		char buf[9];
+
+		buf[8] = '\0';
+		DEBUG("Reading mask\n");
+
+		for (i = words; i > 0; i--) {
+			ret = read_all(buf, 8, fd);
+			if (ret < 0)
+				return ret;
+
+			sscanf(buf, "%08x", &mask[i - 1]);
+			DEBUG("mask[%lu] = 0x%x\n",
+					(unsigned long)(i - 1), mask[i - 1]);
+		}
+	}
+
+	if (read_len > 0) {
+		char c;
+		ssize_t nb = read_all(&c, 1, fd);
+		if (nb > 0 && c != '\n')
+			read_len = -EIO;
+	}
+
+	return (ssize_t) read_len;
+}
+
+static ssize_t read_error_code(int fd)
+{
+	/*
+	 * The server returns two integer codes.
+	 * The first one is returned right after the WRITEBUF command is issued,
+	 * and corresponds to the error code returned when the server attempted
+	 * to open the device.
+	 * If zero, a second error code is returned, that corresponds (if positive)
+	 * to the number of bytes written.
+	 *
+	 * To speed up things, we delay error reporting. We just send out the
+	 * data without reading the error code that the server gives us, because
+	 * the answer will take too much time. If an error occured, it will be
+	 * reported by the next call to iio_buffer_push().
+	 */
+
+	unsigned int i;
+	long resp = 0;
+
+	for (i = 0; i < 2; i++) {
+		ssize_t ret = read_integer(fd, &resp);
+		if (ret < 0)
+			return ret;
+		if (resp < 0)
+			return (ssize_t) resp;
+	}
+
+	return (ssize_t) resp;
+}
+
+static ssize_t write_rwbuf_command(const struct iio_device *dev,
+		const char *cmd)
+{
+	struct iio_device_pdata *pdata = dev->pdata;
+	int fd = pdata->fd;
+
+	if (pdata->wait_for_err_code) {
+		ssize_t ret = read_error_code(fd);
+
+		pdata->wait_for_err_code = false;
+		if (ret < 0)
+			return ret;
+	}
+
+	return write_command(cmd, fd);
+}
+
 static ssize_t network_do_splice(int fd_out, int fd_in, size_t len)
 {
 	int pipefd[2];
 	ssize_t ret, read_len = len;
 
-	ret = (ssize_t) pipe(pipefd);
+	ret = (ssize_t) pipe2(pipefd, O_CLOEXEC);
 	if (ret < 0)
 		return -errno;
 
@@ -643,7 +674,6 @@ static ssize_t network_get_buffer(const struct iio_device *dev,
 	struct iio_device_pdata *pdata = dev->pdata;
 	ssize_t ret, read = 0;
 	int memfd;
-	bool tx;
 
 	if (pdata->is_cyclic)
 		return -ENOSYS;
@@ -654,7 +684,7 @@ static ssize_t network_get_buffer(const struct iio_device *dev,
 	 *
 	 * O_TMPFILE -> Linux 3.11.
 	 * TODO: use memfd_create (Linux 3.17) */
-	memfd = open(P_tmpdir, O_RDWR | O_TMPFILE | O_EXCL, S_IRWXU);
+	memfd = open(P_tmpdir, O_RDWR | O_TMPFILE | O_EXCL | O_CLOEXEC, S_IRWXU);
 	if (memfd < 0)
 		return -ENOSYS;
 
@@ -673,7 +703,7 @@ static ssize_t network_get_buffer(const struct iio_device *dev,
 
 		iio_mutex_lock(pdata->lock);
 
-		ret = write_rwbuf_command(dev, buf, false);
+		ret = write_rwbuf_command(dev, buf);
 		if (ret < 0)
 			goto err_close_memfd;
 
@@ -705,7 +735,7 @@ static ssize_t network_get_buffer(const struct iio_device *dev,
 				dev->id, (unsigned long) len);
 
 		iio_mutex_lock(pdata->lock);
-		ret = write_rwbuf_command(dev, buf, false);
+		ret = write_rwbuf_command(dev, buf);
 		if (ret < 0)
 			goto err_unlock;
 
@@ -739,7 +769,7 @@ static ssize_t network_get_buffer(const struct iio_device *dev,
 	}
 
 	*addr_ptr = pdata->mmap_addr;
-	return read ? read : bytes_used;
+	return read ? read : (ssize_t) bytes_used;
 
 err_close_memfd:
 	close(memfd);
@@ -858,8 +888,6 @@ static int network_set_timeout(struct iio_context *ctx, unsigned int timeout)
 		char buf[1024];
 		iio_strerror(-ret, buf, sizeof(buf));
 		WARNING("Unable to set R/W timeout: %s\n", buf);
-	} else {
-		ctx->rw_timeout_ms = timeout;
 	}
 	return ret;
 }
@@ -916,39 +944,13 @@ static const struct iio_backend_ops network_ops = {
 static ssize_t network_write_data(struct iio_context_pdata *pdata,
 		int desc, const char *src, size_t len)
 {
-	ssize_t ret;
-
-	ret = send(desc, src, (int) len, 0);
-	if (ret < 0) {
-#ifdef _WIN32
-		return (ssize_t) -WSAGetLastError();
-#else
-		return (ssize_t) -errno;
-#endif
-	} else if (ret == 0) {
-		return -EPIPE;
-	} else {
-		return ret;
-	}
+	return network_send(desc, src, len, 0);
 }
 
 static ssize_t network_read_data(struct iio_context_pdata *pdata,
 		int desc, char *dst, size_t len)
 {
-	ssize_t ret;
-
-	ret = recv(desc, dst, (int) len, 0);
-	if (ret < 0) {
-#ifdef _WIN32
-		return (ssize_t) -WSAGetLastError();
-#else
-		return (ssize_t) -errno;
-#endif
-	} else if (ret == 0) {
-		return -EPIPE;
-	} else {
-		return ret;
-	}
+	return network_recv(desc, dst, len, 0);
 }
 
 static ssize_t network_read_line(struct iio_context_pdata *pdata,
@@ -958,8 +960,7 @@ static ssize_t network_read_line(struct iio_context_pdata *pdata,
 #ifdef __linux__
 	ssize_t ret;
 
-	/* First read from the socket without advancing the read offset */
-	ret = recv(desc, dst, len, MSG_PEEK);
+	ret = network_recv(desc, dst, len, MSG_PEEK);
 	if (ret < 0)
 		return ret;
 
@@ -971,7 +972,7 @@ static ssize_t network_read_line(struct iio_context_pdata *pdata,
 		return -EIO;
 
 	/* Advance the read offset to the byte following the \n */
-	return recv(desc, dst, i + 1, MSG_TRUNC);
+	return network_recv(desc, dst, i + 1, MSG_TRUNC);
 #else
 	bool found = false;
 
@@ -987,8 +988,10 @@ static ssize_t network_read_line(struct iio_context_pdata *pdata,
 			break;
 	}
 
-	dst[i] = '\0';
-	return (ssize_t) i;
+	if (!found || i == len - 1)
+		return -EIO;
+
+	return (ssize_t) i + 1;
 #endif
 }
 
@@ -1032,7 +1035,9 @@ struct iio_context * network_create_context(const char *host)
 
 		ret = discover_host(&address, &port);
 		if (ret < 0) {
-			DEBUG("Unable to find host: %s\n", strerror(-ret));
+			char buf[1024];
+			iio_strerror(-ret, buf, sizeof(buf));
+			DEBUG("Unable to find host: %s\n", buf);
 			errno = -ret;
 			return NULL;
 		}
@@ -1061,7 +1066,7 @@ struct iio_context * network_create_context(const char *host)
 		goto err_free_addrinfo;
 	}
 
-	pdata = calloc(1, sizeof(*pdata));
+	pdata = zalloc(sizeof(*pdata));
 	if (!pdata) {
 		errno = ENOMEM;
 		goto err_close_socket;
@@ -1137,7 +1142,7 @@ struct iio_context * network_create_context(const char *host)
 	for (i = 0; i < ctx->nb_devices; i++) {
 		struct iio_device *dev = ctx->devices[i];
 
-		dev->pdata = calloc(1, sizeof(*dev->pdata));
+		dev->pdata = zalloc(sizeof(*dev->pdata));
 		if (!dev->pdata) {
 			ret = -ENOMEM;
 			goto err_free_description;
@@ -1154,10 +1159,6 @@ struct iio_context * network_create_context(const char *host)
 			goto err_free_description;
 		}
 	}
-
-	ret = iio_context_init(ctx);
-	if (ret < 0)
-		goto err_free_description;
 
 	if (ctx->description) {
 		size_t desc_len = strlen(description);

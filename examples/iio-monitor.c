@@ -16,10 +16,14 @@
  *
  * */
 
+#define _BSD_SOURCE
+
 #include <cdk/cdk.h>
 #include <iio.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <unistd.h>
+#include <string.h>
 
 #define ARRAY_SIZE(x) (sizeof(x) ? sizeof(x) / sizeof((x)[0]) : 0)
 
@@ -28,10 +32,8 @@
 #define BLUE	050
 
 static int selected = -1;
-static pthread_t thd;
 
 static WINDOW *win, *left, *right;
-struct iio_context *ctx;
 static bool stop;
 
 static bool channel_has_attr(struct iio_channel *chn, const char *attr)
@@ -47,7 +49,7 @@ static bool is_valid_channel(struct iio_channel *chn)
 {
 	return !iio_channel_is_output(chn) &&
 		(channel_has_attr(chn, "raw") ||
-		 channel_has_attr(chn, "processed"));
+		 channel_has_attr(chn, "input"));
 }
 
 static double get_channel_value(struct iio_channel *chn)
@@ -55,8 +57,8 @@ static double get_channel_value(struct iio_channel *chn)
 	char buf[1024];
 	double val;
 
-	if (channel_has_attr(chn, "processed")) {
-		iio_channel_attr_read(chn, "processed", buf, sizeof(buf));
+	if (channel_has_attr(chn, "input")) {
+		iio_channel_attr_read(chn, "input", buf, sizeof(buf));
 		val = strtod(buf, NULL);
 	} else {
 		iio_channel_attr_read(chn, "raw", buf, sizeof(buf));
@@ -73,12 +75,13 @@ static double get_channel_value(struct iio_channel *chn)
 		}
 	}
 
-	val = (double) ((unsigned long) val) / 1000.0;
-	return val;
+	return val / 1000.0;
 }
 
 static void * read_thd(void *d)
 {
+	struct iio_context *ctx = d;
+
 	while (!stop) {
 		struct iio_device *dev;
 		const char *name;
@@ -101,13 +104,13 @@ static void * read_thd(void *d)
 
 		getmaxyx(right, row, col);
 
-		eraseCursesWindow(right);
-		boxWindow(right, 0);
+		werase(right);
 
 		sprintf(buf, "</B>Device selected: </%u>%s<!%u><!B>",
 				RED, name, RED);
 		str = char2Chtype(buf, &len, &align);
 		writeChtype(right, 2, line, str, HORIZONTAL, 0, len);
+		freeChtype(str);
 		line += 2;
 
 		nb_channels = iio_device_get_channels_count(dev);
@@ -131,6 +134,7 @@ static void * read_thd(void *d)
 			str = char2Chtype(buf, &len, &align);
 			writeChtype(right, 2, line, str,
 					HORIZONTAL, 0, len);
+			freeChtype(str);
 
 			sprintf(buf, "</%u></B>%.3lf %s<!B><!%u>",
 					YELLOW, get_channel_value(chn),
@@ -138,6 +142,7 @@ static void * read_thd(void *d)
 			str = char2Chtype(buf, &len, &align);
 			writeChtype(right, col / 2, line++,
 					str, HORIZONTAL, 0, len);
+			freeChtype(str);
 		}
 
 		if (nb == 0) {
@@ -146,61 +151,22 @@ static void * read_thd(void *d)
 					HORIZONTAL, 0, sizeof(msg) - 1);
 		}
 
-		wrefresh(right);
+		boxWindow(right, 0);
 	}
 	return NULL;
 }
 
-int main()
+static void show_main_screen(struct iio_context *ctx)
 {
-	CDKSCREEN *screen;
-	CDKSCROLL *list;
-	int row, col;
 	unsigned int i, nb_devices;
-
+	CDKSCREEN *screen;
 	char **dev_names;
+	CDKSCROLL *list;
+	pthread_t thd;
 
-	ctx = iio_create_local_context();
-
-	win = initscr();
-	noecho();
-	keypad(win, TRUE);
-	getmaxyx(win, row, col);
-	initCDKColor();
-	screen = initCDKScreen(win);
-
-	left = newwin(row, col / 2, 0, 0);
-	right = newwin(row, col / 2, 0, col / 2);
-
-	if (ctx) {
-		char *title[] = {
-			"Do you want to connect to a remote IIOD server?",
-		};
-		char *buttons[] = {
-			"No",
-			"Yes",
-		};
-		int ret = popupDialog(screen, title, ARRAY_SIZE(title),
-				buttons, ARRAY_SIZE(buttons));
-		if (ret == 1) {
-			iio_context_destroy(ctx);
-			ctx = NULL;
-		}
-	}
-
-	if (!ctx) {
-		char *hostname = getString(screen,
-				"Please enter the IP or hostname of the server",
-				"Hostname:  ", "localhost");
-		ctx = iio_create_network_context(hostname);
-		if (!ctx)
-			goto err_destroy_cdk;
-	}
-
-	destroyCDKScreen(screen);
 	screen = initCDKScreen(left);
 
-	pthread_create(&thd, NULL, read_thd, NULL);
+	pthread_create(&thd, NULL, read_thd, ctx);
 
 	nb_devices = iio_context_get_devices_count(ctx);
 	dev_names = malloc(nb_devices * sizeof(char *));
@@ -232,14 +198,62 @@ int main()
 
 	pthread_join(thd, NULL);
 
-	iio_context_destroy(ctx);
-
 	destroyCDKScroll(list);
 	for (i = 0; i < nb_devices; i++)
 		free(dev_names[i]);
 	free(dev_names);
-err_destroy_cdk:
 	destroyCDKScreen(screen);
+}
+
+int main(void)
+{
+	struct iio_context *ctx;
+	CDKSCREEN *screen;
+	int row, col;
+
+	ctx = iio_create_local_context();
+
+	win = initscr();
+	noecho();
+	keypad(win, TRUE);
+	getmaxyx(win, row, col);
+	initCDKColor();
+	screen = initCDKScreen(win);
+
+	left = newwin(row, col / 2, 0, 0);
+	right = newwin(row, col / 2, 0, col / 2);
+
+	if (ctx) {
+		char *title[] = {
+			"Do you want to connect to a remote IIOD server?",
+		};
+		char *buttons[] = {
+			"No",
+			"Yes",
+		};
+		int ret = popupDialog(screen, title, ARRAY_SIZE(title),
+				buttons, ARRAY_SIZE(buttons));
+		if (ret == 1) {
+			iio_context_destroy(ctx);
+			ctx = NULL;
+		}
+	}
+
+	if (!ctx) {
+		char *uri = getString(screen,
+				"Please enter the URI (e.g. ip:192.168.1.1, usb:3.10) of the server",
+				"URI:  ", "ip:localhost");
+		ctx = iio_create_context_from_uri(uri);
+		freeChar(uri);
+	}
+
+	destroyCDKScreen(screen);
+
+	if (ctx) {
+		show_main_screen(ctx);
+		iio_context_destroy(ctx);
+	}
+
 	endCDK();
 	delwin(left);
 	delwin(right);
