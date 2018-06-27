@@ -1,8 +1,9 @@
 /*
  * libiio - Library for interfacing industrial I/O (IIO) devices
  *
- * Copyright (C) 2014 Analog Devices, Inc.
+ * Copyright (C) 2014-2018 Analog Devices, Inc.
  * Author: Paul Cercueil <paul.cercueil@analog.com>
+ *         that Michael Hennerich <michael.hennerich@analog.com>
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -24,7 +25,15 @@
 #include <string.h>
 #include <errno.h>
 
-#define MY_NAME "iio_readdev"
+#ifdef _WIN32
+#include <windows.h>
+#include <fcntl.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+
+#define MY_NAME "iio_writedev"
 
 #define SAMPLES_PER_READ 256
 #define DEFAULT_FREQ_HZ  100
@@ -38,6 +47,7 @@ static const struct option options[] = {
 	  {"samples", required_argument, 0, 's' },
 	  {"timeout", required_argument, 0, 'T'},
 	  {"auto", no_argument, 0, 'a'},
+	  {"cyclic", no_argument, 0, 'c'},
 	  {0, 0, 0, 0},
 };
 
@@ -47,9 +57,10 @@ static const char *options_descriptions[] = {
 	"Use the context with the provided URI.",
 	"Use the specified trigger.",
 	"Size of the capture buffer. Default is 256.",
-	"Number of samples to capture, 0 = infinite. Default is 0.",
+	"Number of samples to write, 0 = infinite. Default is 0.",
 	"Buffer timeout in milliseconds. 0 = no timeout",
 	"Scan for available contexts and if only one is available use it.",
+	"Use cyclic buffer mode.",
 };
 
 static void usage(void)
@@ -184,10 +195,10 @@ static void setup_sig_handler(void)
 
 #endif
 
-static ssize_t print_sample(const struct iio_channel *chn,
+static ssize_t read_sample(const struct iio_channel *chn,
 		void *buf, size_t len, void *d)
 {
-	fwrite(buf, 1, len, stdout);
+	size_t nb = fread(buf, 1, len, stdin);
 	if (num_samples != 0) {
 		num_samples--;
 		if (num_samples == 0) {
@@ -195,7 +206,7 @@ static ssize_t print_sample(const struct iio_channel *chn,
 			return -1;
 		}
 	}
-	return (ssize_t) len;
+	return (ssize_t) nb;
 }
 
 static struct iio_context *scan(void)
@@ -256,8 +267,9 @@ int main(int argc, char **argv)
 	size_t sample_size;
 	int timeout = -1;
 	bool scan_for_context = false;
+	bool cyclic_buffer = false;
 
-	while ((c = getopt_long(argc, argv, "+hn:u:t:b:s:T:a",
+	while ((c = getopt_long(argc, argv, "+hn:u:t:b:s:T:ac",
 					options, &option_index)) != -1) {
 		switch (c) {
 		case 'h':
@@ -283,6 +295,9 @@ int main(int argc, char **argv)
 			break;
 		case 'T':
 			timeout = atoi(optarg);
+			break;
+		case 'c':
+			cyclic_buffer = true;
 			break;
 		case '?':
 			return EXIT_FAILURE;
@@ -369,7 +384,7 @@ int main(int argc, char **argv)
 
 	sample_size = iio_device_get_sample_size(dev);
 
-	buffer = iio_device_create_buffer(dev, buffer_size, false);
+	buffer = iio_device_create_buffer(dev, buffer_size, cyclic_buffer);
 	if (!buffer) {
 		char buf[256];
 		iio_strerror(errno, buf, sizeof(buf));
@@ -378,29 +393,23 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	while (app_running) {
-		int ret = iio_buffer_refill(buffer);
-		if (ret < 0) {
-			if (app_running) {
-				char buf[256];
-				iio_strerror(-ret, buf, sizeof(buf));
-				fprintf(stderr, "Unable to refill buffer: %s\n", buf);
-			}
-			break;
-		}
+#ifdef _WIN32
+	_setmode(_fileno( stdin ), _O_BINARY);
+#endif
 
+	while (app_running) {
 		/* If there are only the samples we requested, we don't need to
 		 * demux */
 		if (iio_buffer_step(buffer) == sample_size) {
 			void *start = iio_buffer_start(buffer);
-			size_t read_len, len = (intptr_t) iio_buffer_end(buffer)
+			size_t write_len, len = (intptr_t) iio_buffer_end(buffer)
 				- (intptr_t) start;
 
 			if (num_samples && len > num_samples * sample_size)
 				len = num_samples * sample_size;
 
-			for (read_len = len; len; ) {
-				size_t nb = fwrite(start, 1, len, stdout);
+			for (write_len = len; len; ) {
+				size_t nb = fread(start, 1, len, stdin);
 				if (!nb)
 					goto err_destroy_buffer;
 
@@ -409,14 +418,33 @@ int main(int argc, char **argv)
 			}
 
 			if (num_samples) {
-				num_samples -= read_len / sample_size;
+				num_samples -= write_len / sample_size;
 				if (!num_samples)
 					quit_all(EXIT_SUCCESS);
 			}
 		} else {
-			iio_buffer_foreach_sample(buffer, print_sample, NULL);
+			iio_buffer_foreach_sample(buffer, read_sample, NULL);
+		}
+
+		int ret = iio_buffer_push(buffer);
+		if (ret < 0) {
+			if (app_running) {
+				char buf[256];
+				iio_strerror(-ret, buf, sizeof(buf));
+				fprintf(stderr, "Unable to push buffer: %s\n", buf);
+			}
+			break;
+		}
+
+		while(cyclic_buffer && app_running) {
+#ifdef _WIN32
+			Sleep(1000);
+#else
+			sleep(1);
+#endif
 		}
 	}
+
 
 err_destroy_buffer:
 	iio_buffer_destroy(buffer);

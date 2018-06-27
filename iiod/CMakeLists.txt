@@ -62,3 +62,20 @@ add_definitions(-D_GNU_SOURCE=1)
 if(NOT SKIP_INSTALL_ALL)
 	install(TARGETS iiod RUNTIME DESTINATION ${CMAKE_INSTALL_SBINDIR})
 endif()
+
+if (WITH_SYSTEMD)
+	configure_file(${CMAKE_CURRENT_SOURCE_DIR}/init/iiod.service.cmakein ${PROJECT_BINARY_DIR}/init/iiod.service)
+	install(FILES ${PROJECT_BINARY_DIR}/init/iiod.service DESTINATION ${SYSTEMD_UNIT_INSTALL_DIR})
+endif()
+
+if (WITH_SYSVINIT)
+	configure_file(${CMAKE_CURRENT_SOURCE_DIR}/init/iiod.init.cmakein ${PROJECT_BINARY_DIR}/init/iiod)
+	install(FILES ${PROJECT_BINARY_DIR}/init/iiod
+	        PERMISSIONS OWNER_EXECUTE OWNER_WRITE OWNER_READ
+	        DESTINATION ${SYSVINIT_INSTALL_DIR})
+endif()
+
+if (WITH_UPSTART)
+	configure_file(${CMAKE_CURRENT_SOURCE_DIR}/init/iiod.conf.cmakein ${PROJECT_BINARY_DIR}/init/iiod.conf)
+	install(FILES ${PROJECT_BINARY_DIR}/init/iiod.conf DESTINATION ${UPSTART_CONF_INSTALL_DIR})
+endif()
