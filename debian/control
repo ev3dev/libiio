@@ -13,7 +13,8 @@ Build-Depends: bison,
 	       libusb-1.0-0-dev [linux-any],
 	       libusb2-dev [kfreebsd-any],
 	       libxml2-dev,
-               python-dev
+               python-dev,
+               python3-dev
 Standards-Version: 4.1.4
 Homepage: https://github.com/analogdevicesinc/libiio
 Vcs-Browser: https://github.com/ev3dev/libiio
@@ -71,6 +72,17 @@ Package: python-libiio
 Section: python
 Architecture: all
 Depends: libiio0 (>= ${binary:Version}), ${misc:Depends}, ${python:Depends}
+Description: Python bindings for libiio
+ Libiio is a library that has been conceived to ease the development of
+ applications interfacing Industrial Input/Output (IIO) devices through
+ the IIO subsystem of the Linux kernel.
+ .
+ This package contains the Python bindings for libiio.
+
+Package: python3-libiio
+Section: python
+Architecture: all
+Depends: libiio0 (>= ${binary:Version}), ${misc:Depends}, ${python3:Depends}
 Description: Python bindings for libiio
  Libiio is a library that has been conceived to ease the development of
  applications interfacing Industrial Input/Output (IIO) devices through
