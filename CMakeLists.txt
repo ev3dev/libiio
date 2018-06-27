@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 2.8.7)
 project(libiio C)
 
 set(LIBIIO_VERSION_MAJOR 0)
-set(LIBIIO_VERSION_MINOR 6)
+set(LIBIIO_VERSION_MINOR 7)
 set(VERSION "${LIBIIO_VERSION_MAJOR}.${LIBIIO_VERSION_MINOR}")
 
 # Set the default install path to /usr
@@ -10,22 +10,13 @@ if (NOT WIN32 AND CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
 	set(CMAKE_INSTALL_PREFIX "/usr" CACHE PATH "default install path" FORCE)
 endif()
 
-set(INSTALL_BIN_DIR "${CMAKE_INSTALL_PREFIX}/bin"
-	CACHE PATH "Installation directory for binaries")
-set(INSTALL_LIB_DIR "${CMAKE_INSTALL_PREFIX}/lib"
-	CACHE PATH "Installation directory for libraries")
-set(INSTALL_INC_DIR "${CMAKE_INSTALL_PREFIX}/include"
-	CACHE PATH "Installation directory for headers")
-set(INSTALL_PKGCONFIG_DIR "${INSTALL_LIB_DIR}/pkgconfig"
-	CACHE PATH "Installation directory for pkgconfig (.pc) files")
-set(INSTALL_DATA_DIR "${CMAKE_INSTALL_PREFIX}/share"
-	CACHE PATH "Installation directory for data")
+set(CMAKE_INSTALL_DOCDIR "" CACHE PATH "documentation root (DATAROOTDIR/doc/${PROJECT_NAME}${LIBIIO_VERSION_MAJOR}-doc)")
+include(GNUInstallDirs)
+set(CMAKE_INSTALL_DOCDIR "${CMAKE_INSTALL_DATAROOTDIR}/doc/${PROJECT_NAME}${LIBIIO_VERSION_MAJOR}-doc")
 
-mark_as_advanced(INSTALL_BIN_DIR)
-mark_as_advanced(INSTALL_LIB_DIR)
-mark_as_advanced(INSTALL_INC_DIR)
+set(INSTALL_PKGCONFIG_DIR "${CMAKE_INSTALL_LIBDIR}/pkgconfig"
+	CACHE PATH "Installation directory for pkgconfig (.pc) files")
 mark_as_advanced(INSTALL_PKGCONFIG_DIR)
-mark_as_advanced(INSTALL_DATA_DIR)
 
 if (NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING
@@ -49,7 +40,13 @@ if (NOT WIN32)
 endif()
 
 if (CMAKE_COMPILER_IS_GNUCC)
-	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wpedantic -Wno-unused-parameter -Wno-sign-compare")
+	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare")
+
+	include(CheckCCompilerFlag)
+	check_c_compiler_flag(-Wpedantic HAS_WPEDANTIC)
+	if (HAS_WPEDANTIC)
+		set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wpedantic")
+	endif()
 endif()
 
 IF(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
@@ -59,6 +56,12 @@ IF(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 	if (WITH_IIOD AND NOT WITH_LOCAL_BACKEND)
 		message(SEND_ERROR "IIOD can only be enabled if the local backend is enabled")
 	endif()
+	if (WITH_IIOD)
+		set(NEED_THREADS 1)
+	endif()
+
+	set(CMAKE_REQUIRED_DEFINITIONS "-D_GNU_SOURCE=1")
+	add_definitions(-D_GNU_SOURCE=1)
 endif()
 
 option(ENABLE_IPV6 "Define if you want to enable IPv6 support" ON)
@@ -74,7 +77,7 @@ if (ENABLE_IPV6)
 	endif()
 endif()
 
-set(LIBIIO_CFILES channel.c device.c context.c buffer.c utilities.c)
+set(LIBIIO_CFILES channel.c device.c context.c buffer.c utilities.c scan.c)
 set(LIBIIO_HEADERS iio.h)
 
 add_definitions(-D_POSIX_C_SOURCE=200809L -D__XSI_VISIBLE=500 -DLIBIIO_EXPORTS=1)
@@ -123,6 +126,7 @@ if (LIBUSB_LIBRARIES AND LIBUSB_INCLUDE_DIR)
 		set(LIBS_TO_LINK ${LIBS_TO_LINK} ${LIBUSB_LIBRARIES})
 		set(IIOD_CLIENT 1)
 		set(NEED_LIBXML2 1)
+		set(NEED_THREADS 1)
 
 		include_directories(${LIBUSB_INCLUDE_DIR})
 	endif()
@@ -137,6 +141,8 @@ if (LIBSERIALPORT_LIBRARIES AND LIBSERIALPORT_INCLUDE_DIR)
 		add_definitions(-DSERIAL_BACKEND=1)
 		set(LIBIIO_CFILES ${LIBIIO_CFILES} serial.c)
 		set(LIBS_TO_LINK ${LIBS_TO_LINK} ${LIBSERIALPORT_LIBRARIES})
+
+		set(NEED_THREADS 1)
 		set(IIOD_CLIENT 1)
 		set(NEED_LIBXML2 1)
 
@@ -153,12 +159,30 @@ if(WITH_NETWORK_BACKEND)
 
 	if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 		include(CheckCSourceCompiles)
-		set(CMAKE_REQUIRED_DEFINITIONS "-D_GNU_SOURCE=1")
 		check_c_source_compiles("#include <fcntl.h>\nint main(void) { return O_TMPFILE; }" HAS_O_TMPFILE)
 
 		if (HAS_O_TMPFILE)
-			add_definitions(-D_GNU_SOURCE=1 -DWITH_NETWORK_GET_BUFFER=1)
-		endif()
+			option(WITH_NETWORK_GET_BUFFER "Enable experimental zero-copy transfers" OFF)
+
+			if (WITH_NETWORK_GET_BUFFER)
+				add_definitions(-DWITH_NETWORK_GET_BUFFER=1)
+			endif(WITH_NETWORK_GET_BUFFER)
+		endif(HAS_O_TMPFILE)
+
+		check_c_source_compiles("#include <sys/eventfd.h>\nint main(void) { return eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK); }" HAS_EVENTFD)
+
+		if (HAS_EVENTFD)
+			add_definitions(-DWITH_NETWORK_EVENTFD=1)
+		endif(HAS_EVENTFD)
+	endif()
+
+	if(NOT WIN32)
+		include(CheckCSourceCompiles)
+		check_c_source_compiles("#include <unistd.h>\n#include <fcntl.h>\nint main(void) { int fd[2]; return pipe2(fd, O_CLOEXEC | O_NONBLOCK); }" HAS_PIPE2)
+
+		if (HAS_PIPE2)
+			add_definitions(-DHAS_PIPE2=1)
+		endif(HAS_PIPE2)
 	endif()
 
 	add_definitions(-DNETWORK_BACKEND=1)
@@ -177,7 +201,19 @@ if(WITH_NETWORK_BACKEND)
 	set(NEED_LIBXML2 1)
 endif()
 
-include(FindLibXml2)
+# Since libxml2-2.9.2, libxml2 provides its own LibXml2-config.cmake, with all
+# variables correctly set.
+# So, try first to find the CMake module provided by libxml2 package, then fallback
+# on the CMake's FindLibXml2.cmake module (which can lack some definition, especially
+# in static build case).
+find_package(LibXml2 QUIET NO_MODULE)
+if(DEFINED LIBXML2_VERSION_STRING)
+	set(LIBXML2_FOUND ON)
+	set(LIBXML2_INCLUDE_DIR ${LIBXML2_INCLUDE_DIRS})
+else()
+	include(FindLibXml2)
+endif()
+
 if (LIBXML2_FOUND)
 	option(WITH_XML_BACKEND "Enable the serial backend" ON)
 
@@ -199,13 +235,14 @@ if (NEED_THREADS)
 
 		if (PTHREAD_LIBRARIES)
 			set(LIBS_TO_LINK ${LIBS_TO_LINK} ${PTHREAD_LIBRARIES})
-			set(LIBIIO_CFILES ${LIBIIO_CFILES} lock.c)
 		else()
-			message(SEND_ERROR "The pthread library is a requirement for the selected backends")
+			message(WARNING "pthread library not found; support for threads will be disabled")
+			add_definitions(-DNO_THREADS=1)
 		endif()
 	else()
-		set(LIBIIO_CFILES ${LIBIIO_CFILES} lock.c)
 	endif()
+
+	set(LIBIIO_CFILES ${LIBIIO_CFILES} lock.c)
 endif()
 
 if (IIOD_CLIENT)
@@ -239,11 +276,11 @@ endif()
 
 if(NOT SKIP_INSTALL_ALL)
 	install(TARGETS iio
-		ARCHIVE DESTINATION "${INSTALL_LIB_DIR}"
-		LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
-		RUNTIME DESTINATION "${INSTALL_BIN_DIR}"
-		FRAMEWORK DESTINATION "${INSTALL_LIB_DIR}"
-		PUBLIC_HEADER DESTINATION "${INSTALL_INC_DIR}")
+		ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+		LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+		RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+		FRAMEWORK DESTINATION ${CMAKE_INSTALL_LIBDIR}
+		PUBLIC_HEADER DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 endif()
 
 find_package(Doxygen)
@@ -261,8 +298,7 @@ if(DOXYGEN_FOUND)
 			COMMENT "Generating API documentation with Doxygen" VERBATIM
 			)
 
-		install(DIRECTORY ${HTML_DEST_DIR}
-			DESTINATION ${INSTALL_DATA_DIR}/doc/libiio${LIBIIO_VERSION_MAJOR}-doc)
+		install(DIRECTORY ${HTML_DEST_DIR} DESTINATION ${CMAKE_INSTALL_DOCDIR})
 	endif()
 else()
 	message(STATUS "Doxygen not found, API documentation won't be generated")

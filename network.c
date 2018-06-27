@@ -64,15 +64,30 @@
 #define IIOD_PORT 30431
 #define IIOD_PORT_STR STRINGIFY(IIOD_PORT)
 
-struct iio_context_pdata {
+struct iio_network_io_context {
 	int fd;
+
+	/* Only buffer IO contexts can be cancelled. */
+	bool cancellable;
+	bool cancelled;
+#if defined(_WIN32)
+	WSAEVENT events[2];
+#elif defined(WITH_NETWORK_EVENTFD)
+	int cancel_fd[1]; /* eventfd */
+#else
+	int cancel_fd[2]; /* pipe */
+#endif
+};
+
+struct iio_context_pdata {
+	struct iio_network_io_context io_ctx;
 	struct addrinfo *addrinfo;
 	struct iio_mutex *lock;
 	struct iiod_client *iiod_client;
 };
 
 struct iio_device_pdata {
-	int fd;
+	struct iio_network_io_context io_ctx;
 #ifdef WITH_NETWORK_GET_BUFFER
 	int memfd;
 	void *mmap_addr;
@@ -83,15 +98,198 @@ struct iio_device_pdata {
 };
 
 #ifdef _WIN32
+
+static int setup_cancel(struct iio_network_io_context *io_ctx)
+{
+	io_ctx->events[0] = WSACreateEvent();
+	if (io_ctx->events[0] == WSA_INVALID_EVENT)
+		return -ENOMEM; /* Pretty much the only error that can happen */
+
+	io_ctx->events[1] = WSACreateEvent();
+	if (io_ctx->events[1] == WSA_INVALID_EVENT) {
+		WSACloseEvent(io_ctx->events[0]);
+		return -ENOMEM;
+	}
+
+	return 0;
+}
+
+static void cleanup_cancel(struct iio_network_io_context *io_ctx)
+{
+	WSACloseEvent(io_ctx->events[0]);
+	WSACloseEvent(io_ctx->events[1]);
+}
+
+static void do_cancel(struct iio_network_io_context *io_ctx)
+{
+	WSASetEvent(io_ctx->events[1]);
+}
+
+static int wait_cancellable(struct iio_network_io_context *io_ctx, bool read)
+{
+	long wsa_events = FD_CLOSE;
+	DWORD ret;
+
+	if (!io_ctx->cancellable)
+		return 0;
+
+	if (read)
+		wsa_events |= FD_READ;
+	else
+		wsa_events |= FD_WRITE;
+
+	WSAEventSelect(io_ctx->fd, NULL, 0);
+	WSAResetEvent(io_ctx->events[0]);
+	WSAEventSelect(io_ctx->fd, io_ctx->events[0], wsa_events);
+
+	ret = WSAWaitForMultipleEvents(2, io_ctx->events, FALSE,
+		WSA_INFINITE, FALSE);
+
+	if (ret == WSA_WAIT_EVENT_0 + 1)
+		return -EBADF;
+
+	return 0;
+}
+
 static int network_get_error(void)
 {
 	return -WSAGetLastError();
 }
+
+static bool network_should_retry(int err)
+{
+	return err == -WSAEWOULDBLOCK;
+}
+
 #else
+
+#include <poll.h>
+
+#if defined(WITH_NETWORK_EVENTFD)
+
+#include <sys/eventfd.h>
+
+static int create_cancel_fd(struct iio_network_io_context *io_ctx)
+{
+	io_ctx->cancel_fd[0] = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (io_ctx->cancel_fd[0] < 0)
+		return -errno;
+	return 0;
+}
+
+static void cleanup_cancel(struct iio_network_io_context *io_ctx)
+{
+	close(io_ctx->cancel_fd[0]);
+}
+
+#define CANCEL_WR_FD 0
+
+#else
+
+static int create_cancel_fd(struct iio_network_io_context *io_ctx)
+{
+	int ret;
+
+#ifdef HAS_PIPE2
+	ret = pipe2(io_ctx->cancel_fd, O_CLOEXEC | O_NONBLOCK);
+	if (ret < 0 && errno != ENOSYS) /* If ENOSYS try pipe() */
+		return -errno;
+#endif
+	ret = pipe(io_ctx->cancel_fd);
+	if (ret < 0)
+		return -errno;
+	ret = set_blocking_mode(io_ctx->cancel_fd[0], false);
+	if (ret < 0)
+		goto err_close;
+	ret = set_blocking_mode(io_ctx->cancel_fd[1], false);
+	if (ret < 0)
+		goto err_close;
+
+	return 0;
+err_close:
+	close(io_ctx->cancel_fd[0]);
+	close(io_ctx->cancel_fd[1]);
+	return ret;
+}
+
+static void cleanup_cancel(struct iio_network_io_context *io_ctx)
+{
+	close(io_ctx->cancel_fd[0]);
+	close(io_ctx->cancel_fd[1]);
+}
+
+#define CANCEL_WR_FD 1
+
+#endif
+
+static int setup_cancel(struct iio_network_io_context *io_ctx)
+{
+	int ret;
+
+	ret = set_blocking_mode(io_ctx->fd, false);
+	if (ret)
+		return ret;
+
+	return create_cancel_fd(io_ctx);
+}
+
+static void do_cancel(struct iio_network_io_context *io_ctx)
+{
+	uint64_t event = 1;
+	int ret;
+
+	ret = write(io_ctx->cancel_fd[CANCEL_WR_FD], &event, sizeof(event));
+	if (ret == -1) {
+		/* If this happens something went very seriously wrong */
+		char err_str[1024];
+		iio_strerror(errno, err_str, sizeof(err_str));
+		ERROR("Unable to signal cancellation event: %s\n", err_str);
+	}
+}
+
+static int wait_cancellable(struct iio_network_io_context *io_ctx, bool read)
+{
+	struct pollfd pfd[2];
+	int ret;
+
+	if (!io_ctx->cancellable)
+		return 0;
+
+	memset(pfd, 0, sizeof(pfd));
+
+	pfd[0].fd = io_ctx->fd;
+	if (read)
+		pfd[0].events = POLLIN;
+	else
+		pfd[0].events = POLLOUT;
+	pfd[1].fd = io_ctx->cancel_fd[0];
+	pfd[1].events = POLLIN;
+
+	do {
+		do {
+			ret = poll(pfd, 2, -1);
+		} while (ret == -1 && errno == EINTR);
+
+		if (ret == -1)
+			return -errno;
+
+		if (pfd[1].revents & POLLIN)
+			return -EBADF;
+	} while (!(pfd[0].revents & (pfd[0].events | POLLERR | POLLHUP)));
+
+	return 0;
+}
+
 static int network_get_error(void)
 {
 	return -errno;
 }
+
+static bool network_should_retry(int err)
+{
+	return err == -EINTR || err == -EAGAIN;
+}
+
 #endif
 
 #ifdef HAVE_AVAHI
@@ -199,50 +397,61 @@ err_free_poll:
 }
 #endif /* HAVE_AVAHI */
 
-static ssize_t network_recv(int fd, void *data, size_t len, int flags)
+static ssize_t network_recv(struct iio_network_io_context *io_ctx,
+		void *data, size_t len, int flags)
 {
 	ssize_t ret;
 	int err;
 
 	while (1) {
-		ret = recv(fd, data, (int) len, flags);
+		ret = wait_cancellable(io_ctx, true);
+		if (ret < 0)
+			return ret;
+
+		ret = recv(io_ctx->fd, data, (int) len, flags);
 		if (ret == 0)
 			return -EPIPE;
 		else if (ret > 0)
 			break;
 
 		err = network_get_error();
-		if (err != -EINTR)
+		if (network_should_retry(err))
 			return (ssize_t) err;
 	}
 	return ret;
 }
 
-static ssize_t network_send(int fd, const void *data, size_t len, int flags)
+static ssize_t network_send(struct iio_network_io_context *io_ctx,
+		const void *data, size_t len, int flags)
 {
 	ssize_t ret;
 	int err;
 
 	while (1) {
-		ret = send(fd, data, (int) len, flags);
+		ret = wait_cancellable(io_ctx, false);
+		if (ret < 0)
+			return ret;
+
+		ret = send(io_ctx->fd, data, (int) len, flags);
 		if (ret == 0)
 			return -EPIPE;
 		else if (ret > 0)
 			break;
 
 		err = network_get_error();
-		if (err != -EINTR)
+		if (network_should_retry(err))
 			return (ssize_t) err;
 	}
 
 	return ret;
 }
 
-static ssize_t write_all(const void *src, size_t len, int fd)
+static ssize_t write_all(struct iio_network_io_context *io_ctx,
+		const void *src, size_t len)
 {
 	uintptr_t ptr = (uintptr_t) src;
 	while (len) {
-		ssize_t ret = network_send(fd, (const void *) ptr, len, 0);
+		ssize_t ret = network_send(io_ctx, (const void *) ptr, len, 0);
 		if (ret < 0)
 			return ret;
 		ptr += ret;
@@ -251,12 +460,13 @@ static ssize_t write_all(const void *src, size_t len, int fd)
 	return (ssize_t)(ptr - (uintptr_t) src);
 }
 
-static ssize_t write_command(const char *cmd, int fd)
+static ssize_t write_command(struct iio_network_io_context *io_ctx,
+		const char *cmd)
 {
 	ssize_t ret;
 
 	DEBUG("Writing command: %s\n", cmd);
-	ret = write_all(cmd, strlen(cmd), fd);
+	ret = write_all(io_ctx, cmd, strlen(cmd));
 	if (ret < 0) {
 		char buf[1024];
 		iio_strerror(-ret, buf, sizeof(buf));
@@ -265,11 +475,20 @@ static ssize_t write_command(const char *cmd, int fd)
 	return ret;
 }
 
+static void network_cancel(const struct iio_device *dev)
+{
+	struct iio_device_pdata *ppdata = dev->pdata;
+
+	do_cancel(&ppdata->io_ctx);
+
+	ppdata->io_ctx.cancelled = true;
+}
+
 #ifndef _WIN32
 
 /* Use it if available */
-#ifndef SOCK_CLOSEXEC
-#define SOCK_CLOSEXEC 0
+#ifndef SOCK_CLOEXEC
+#define SOCK_CLOEXEC 0
 #endif
 
 /* The purpose of this function is to provide a version of connect()
@@ -409,33 +628,45 @@ static int network_open(const struct iio_device *dev,
 {
 	struct iio_context_pdata *pdata = dev->ctx->pdata;
 	struct iio_device_pdata *ppdata = dev->pdata;
-	int fd, ret = -EBUSY;
+	int ret = -EBUSY;
 
 	iio_mutex_lock(ppdata->lock);
-	if (ppdata->fd >= 0)
+	if (ppdata->io_ctx.fd >= 0)
 		goto out_mutex_unlock;
 
 	ret = create_socket(pdata->addrinfo);
 	if (ret < 0)
 		goto out_mutex_unlock;
 
-	fd = ret;
+	ppdata->io_ctx.fd = ret;
+	ppdata->io_ctx.cancelled = false;
+	ppdata->io_ctx.cancellable = true;
 
-	ret = iiod_client_open_unlocked(pdata->iiod_client, fd,
-			dev, samples_count, cyclic);
-	if (ret < 0) {
-		close(fd);
-		goto out_mutex_unlock;
-	}
+	ret = setup_cancel(&ppdata->io_ctx);
+	if (ret < 0)
+		goto err_close_socket;
+
+	ret = iiod_client_open_unlocked(pdata->iiod_client,
+			&ppdata->io_ctx, dev, samples_count, cyclic);
+	if (ret < 0)
+		goto err_cleanup_cancel;
 
 	ppdata->is_tx = iio_device_is_tx(dev);
 	ppdata->is_cyclic = cyclic;
-	ppdata->fd = fd;
 	ppdata->wait_for_err_code = false;
 #ifdef WITH_NETWORK_GET_BUFFER
 	ppdata->mmap_len = samples_count * iio_device_get_sample_size(dev);
 #endif
 
+	iio_mutex_unlock(ppdata->lock);
+
+	return 0;
+
+err_cleanup_cancel:
+	cleanup_cancel(&ppdata->io_ctx);
+err_close_socket:
+	close(ppdata->io_ctx.fd);
+	ppdata->io_ctx.fd = -1;
 out_mutex_unlock:
 	iio_mutex_unlock(ppdata->lock);
 	return ret;
@@ -448,14 +679,20 @@ static int network_close(const struct iio_device *dev)
 
 	iio_mutex_lock(pdata->lock);
 
-	if (pdata->fd >= 0) {
-		ret = iiod_client_close_unlocked(dev->ctx->pdata->iiod_client,
-				pdata->fd, dev);
+	if (pdata->io_ctx.fd >= 0) {
+		if (!pdata->io_ctx.cancelled) {
+			ret = iiod_client_close_unlocked(
+					dev->ctx->pdata->iiod_client,
+					&pdata->io_ctx, dev);
 
-		write_command("\r\nEXIT\r\n", pdata->fd);
+			write_command(&pdata->io_ctx, "\r\nEXIT\r\n");
+		} else {
+			ret = 0;
+		}
 
-		close(pdata->fd);
-		pdata->fd = -1;
+		cleanup_cancel(&pdata->io_ctx);
+		close(pdata->io_ctx.fd);
+		pdata->io_ctx.fd = -1;
 	}
 
 #ifdef WITH_NETWORK_GET_BUFFER
@@ -481,7 +718,7 @@ static ssize_t network_read(const struct iio_device *dev, void *dst, size_t len,
 
 	iio_mutex_lock(pdata->lock);
 	ret = iiod_client_read_unlocked(dev->ctx->pdata->iiod_client,
-			pdata->fd, dev, dst, len, mask, words);
+			&pdata->io_ctx, dev, dst, len, mask, words);
 	iio_mutex_unlock(pdata->lock);
 
 	return ret;
@@ -495,7 +732,7 @@ static ssize_t network_write(const struct iio_device *dev,
 
 	iio_mutex_lock(pdata->lock);
 	ret = iiod_client_write_unlocked(dev->ctx->pdata->iiod_client,
-			pdata->fd, dev, src, len);
+			&pdata->io_ctx, dev, src, len);
 	iio_mutex_unlock(pdata->lock);
 
 	return ret;
@@ -503,11 +740,12 @@ static ssize_t network_write(const struct iio_device *dev,
 
 #ifdef WITH_NETWORK_GET_BUFFER
 
-static ssize_t read_all(void *dst, size_t len, int fd)
+static ssize_t read_all(struct iio_network_io_context *io_ctx,
+		void *dst, size_t len)
 {
 	uintptr_t ptr = (uintptr_t) dst;
 	while (len) {
-		ssize_t ret = network_recv(fd, (void *) ptr, len, 0);
+		ssize_t ret = network_recv(io_ctx, (void *) ptr, len, 0);
 		if (ret < 0)
 			return ret;
 		ptr += ret;
@@ -516,7 +754,7 @@ static ssize_t read_all(void *dst, size_t len, int fd)
 	return (ssize_t)(ptr - (uintptr_t) dst);
 }
 
-static int read_integer(int fd, long *val)
+static int read_integer(struct iio_network_io_context *io_ctx, long *val)
 {
 	unsigned int i;
 	char buf[1024], *ptr;
@@ -524,7 +762,7 @@ static int read_integer(int fd, long *val)
 	bool found = false;
 
 	for (i = 0; i < sizeof(buf) - 1; i++) {
-		ret = read_all(buf + i, 1, fd);
+		ret = read_all(io_ctx, buf + i, 1);
 		if (ret < 0)
 			return (int) ret;
 
@@ -544,12 +782,13 @@ static int read_integer(int fd, long *val)
 	return 0;
 }
 
-static ssize_t network_read_mask(int fd, uint32_t *mask, size_t words)
+static ssize_t network_read_mask(struct iio_network_io_context *io_ctx,
+		uint32_t *mask, size_t words)
 {
 	long read_len;
 	ssize_t ret;
 
-	ret = read_integer(fd, &read_len);
+	ret = read_integer(io_ctx, &read_len);
 	if (ret < 0)
 		return ret;
 
@@ -561,7 +800,7 @@ static ssize_t network_read_mask(int fd, uint32_t *mask, size_t words)
 		DEBUG("Reading mask\n");
 
 		for (i = words; i > 0; i--) {
-			ret = read_all(buf, 8, fd);
+			ret = read_all(io_ctx, buf, 8);
 			if (ret < 0)
 				return ret;
 
@@ -573,7 +812,7 @@ static ssize_t network_read_mask(int fd, uint32_t *mask, size_t words)
 
 	if (read_len > 0) {
 		char c;
-		ssize_t nb = read_all(&c, 1, fd);
+		ssize_t nb = read_all(io_ctx, &c, 1);
 		if (nb > 0 && c != '\n')
 			read_len = -EIO;
 	}
@@ -581,7 +820,7 @@ static ssize_t network_read_mask(int fd, uint32_t *mask, size_t words)
 	return (ssize_t) read_len;
 }
 
-static ssize_t read_error_code(int fd)
+static ssize_t read_error_code(struct iio_network_io_context *io_ctx)
 {
 	/*
 	 * The server returns two integer codes.
@@ -601,7 +840,7 @@ static ssize_t read_error_code(int fd)
 	long resp = 0;
 
 	for (i = 0; i < 2; i++) {
-		ssize_t ret = read_integer(fd, &resp);
+		ssize_t ret = read_integer(io_ctx, &resp);
 		if (ret < 0)
 			return ret;
 		if (resp < 0)
@@ -615,29 +854,42 @@ static ssize_t write_rwbuf_command(const struct iio_device *dev,
 		const char *cmd)
 {
 	struct iio_device_pdata *pdata = dev->pdata;
-	int fd = pdata->fd;
 
 	if (pdata->wait_for_err_code) {
-		ssize_t ret = read_error_code(fd);
+		ssize_t ret = read_error_code(&pdata->io_ctx);
 
 		pdata->wait_for_err_code = false;
 		if (ret < 0)
 			return ret;
 	}
 
-	return write_command(cmd, fd);
+	return write_command(&pdata->io_ctx, cmd);
 }
 
-static ssize_t network_do_splice(int fd_out, int fd_in, size_t len)
+static ssize_t network_do_splice(struct iio_device_pdata *pdata, size_t len,
+		bool read)
 {
 	int pipefd[2];
+	int fd_in, fd_out;
 	ssize_t ret, read_len = len;
 
 	ret = (ssize_t) pipe2(pipefd, O_CLOEXEC);
 	if (ret < 0)
 		return -errno;
 
+	if (read) {
+	    fd_in = pdata->io_ctx.fd;
+	    fd_out = pdata->memfd;
+	} else {
+	    fd_in = pdata->memfd;
+	    fd_out = pdata->io_ctx.fd;
+	}
+
 	do {
+		ret = wait_cancellable(&pdata->io_ctx, read);
+		if (ret < 0)
+			goto err_close_pipe;
+
 		/*
 		 * SPLICE_F_NONBLOCK is just here to avoid a deadlock when
 		 * splicing from a socket. As the socket is not in
@@ -646,6 +898,8 @@ static ssize_t network_do_splice(int fd_out, int fd_in, size_t len)
 		 * */
 		ret = splice(fd_in, NULL, pipefd[1], NULL, len,
 				SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+		if (ret < 0 && errno == EAGAIN)
+			continue;
 		if (!ret)
 			ret = -EIO;
 		if (ret < 0)
@@ -707,7 +961,7 @@ static ssize_t network_get_buffer(const struct iio_device *dev,
 		if (ret < 0)
 			goto err_close_memfd;
 
-		ret = network_do_splice(pdata->fd, pdata->memfd, bytes_used);
+		ret = network_do_splice(pdata, bytes_used, false);
 		if (ret < 0)
 			goto err_close_memfd;
 
@@ -740,7 +994,7 @@ static ssize_t network_get_buffer(const struct iio_device *dev,
 			goto err_unlock;
 
 		do {
-			ret = network_read_mask(pdata->fd, mask, words);
+			ret = network_read_mask(&pdata->io_ctx, mask, words);
 			if (!ret)
 				break;
 			if (ret < 0)
@@ -748,7 +1002,7 @@ static ssize_t network_get_buffer(const struct iio_device *dev,
 
 			mask = NULL; /* We read the mask only once */
 
-			ret = network_do_splice(pdata->memfd, pdata->fd, ret);
+			ret = network_do_splice(pdata, ret, true);
 			if (ret < 0)
 				goto err_unlock;
 
@@ -784,8 +1038,8 @@ static ssize_t network_read_dev_attr(const struct iio_device *dev,
 {
 	struct iio_context_pdata *pdata = dev->ctx->pdata;
 
-	return iiod_client_read_attr(pdata->iiod_client, pdata->fd,
-			dev, NULL, attr, dst, len, is_debug);
+	return iiod_client_read_attr(pdata->iiod_client,
+			&pdata->io_ctx, dev, NULL, attr, dst, len, is_debug);
 }
 
 static ssize_t network_write_dev_attr(const struct iio_device *dev,
@@ -793,8 +1047,8 @@ static ssize_t network_write_dev_attr(const struct iio_device *dev,
 {
 	struct iio_context_pdata *pdata = dev->ctx->pdata;
 
-	return iiod_client_write_attr(pdata->iiod_client, pdata->fd,
-			dev, NULL, attr, src, len, is_debug);
+	return iiod_client_write_attr(pdata->iiod_client,
+			&pdata->io_ctx, dev, NULL, attr, src, len, is_debug);
 }
 
 static ssize_t network_read_chn_attr(const struct iio_channel *chn,
@@ -802,8 +1056,8 @@ static ssize_t network_read_chn_attr(const struct iio_channel *chn,
 {
 	struct iio_context_pdata *pdata = chn->dev->ctx->pdata;
 
-	return iiod_client_read_attr(pdata->iiod_client, pdata->fd,
-			chn->dev, chn, attr, dst, len, false);
+	return iiod_client_read_attr(pdata->iiod_client,
+			&pdata->io_ctx, chn->dev, chn, attr, dst, len, false);
 }
 
 static ssize_t network_write_chn_attr(const struct iio_channel *chn,
@@ -811,8 +1065,8 @@ static ssize_t network_write_chn_attr(const struct iio_channel *chn,
 {
 	struct iio_context_pdata *pdata = chn->dev->ctx->pdata;
 
-	return iiod_client_write_attr(pdata->iiod_client, pdata->fd,
-			chn->dev, chn, attr, src, len, false);
+	return iiod_client_write_attr(pdata->iiod_client,
+			&pdata->io_ctx, chn->dev, chn, attr, src, len, false);
 }
 
 static int network_get_trigger(const struct iio_device *dev,
@@ -821,7 +1075,7 @@ static int network_get_trigger(const struct iio_device *dev,
 	struct iio_context_pdata *pdata = dev->ctx->pdata;
 
 	return iiod_client_get_trigger(pdata->iiod_client,
-			pdata->fd, dev, trigger);
+			&pdata->io_ctx, dev, trigger);
 }
 
 static int network_set_trigger(const struct iio_device *dev,
@@ -830,7 +1084,7 @@ static int network_set_trigger(const struct iio_device *dev,
 	struct iio_context_pdata *pdata = dev->ctx->pdata;
 
 	return iiod_client_set_trigger(pdata->iiod_client,
-			pdata->fd, dev, trigger);
+			&pdata->io_ctx, dev, trigger);
 }
 
 static void network_shutdown(struct iio_context *ctx)
@@ -839,8 +1093,8 @@ static void network_shutdown(struct iio_context *ctx)
 	unsigned int i;
 
 	iio_mutex_lock(pdata->lock);
-	write_command("\r\nEXIT\r\n", pdata->fd);
-	close(pdata->fd);
+	write_command(&pdata->io_ctx, "\r\nEXIT\r\n");
+	close(pdata->io_ctx.fd);
 	iio_mutex_unlock(pdata->lock);
 
 	for (i = 0; i < ctx->nb_devices; i++) {
@@ -863,8 +1117,8 @@ static void network_shutdown(struct iio_context *ctx)
 static int network_get_version(const struct iio_context *ctx,
 		unsigned int *major, unsigned int *minor, char git_tag[8])
 {
-	return iiod_client_get_version(ctx->pdata->iiod_client, ctx->pdata->fd,
-			major, minor, git_tag);
+	return iiod_client_get_version(ctx->pdata->iiod_client,
+			&ctx->pdata->io_ctx, major, minor, git_tag);
 }
 
 static unsigned int calculate_remote_timeout(unsigned int timeout)
@@ -877,12 +1131,13 @@ static unsigned int calculate_remote_timeout(unsigned int timeout)
 static int network_set_timeout(struct iio_context *ctx, unsigned int timeout)
 {
 	struct iio_context_pdata *pdata = ctx->pdata;
-	int ret, fd = pdata->fd;
+	int ret, fd = pdata->io_ctx.fd;
 
 	ret = set_socket_timeout(fd, timeout);
 	if (!ret) {
 		timeout = calculate_remote_timeout(timeout);
-		ret = iiod_client_set_timeout(pdata->iiod_client, fd, timeout);
+		ret = iiod_client_set_timeout(pdata->iiod_client,
+			&pdata->io_ctx, timeout);
 	}
 	if (ret < 0) {
 		char buf[1024];
@@ -898,7 +1153,7 @@ static int network_set_kernel_buffers_count(const struct iio_device *dev,
 	struct iio_context_pdata *pdata = dev->ctx->pdata;
 
 	return iiod_client_set_kernel_buffers_count(pdata->iiod_client,
-			pdata->fd, dev, nb_blocks);
+			 &pdata->io_ctx, dev, nb_blocks);
 }
 
 static struct iio_context * network_clone(const struct iio_context *ctx)
@@ -939,28 +1194,35 @@ static const struct iio_backend_ops network_ops = {
 	.get_version = network_get_version,
 	.set_timeout = network_set_timeout,
 	.set_kernel_buffers_count = network_set_kernel_buffers_count,
+
+	.cancel = network_cancel,
 };
 
 static ssize_t network_write_data(struct iio_context_pdata *pdata,
-		int desc, const char *src, size_t len)
+		void *io_data, const char *src, size_t len)
 {
-	return network_send(desc, src, len, 0);
+	struct iio_network_io_context *io_ctx = io_data;
+
+	return network_send(io_ctx, src, len, 0);
 }
 
 static ssize_t network_read_data(struct iio_context_pdata *pdata,
-		int desc, char *dst, size_t len)
+		void *io_data, char *dst, size_t len)
 {
-	return network_recv(desc, dst, len, 0);
+	struct iio_network_io_context *io_ctx = io_data;
+
+	return network_recv(io_ctx, dst, len, 0);
 }
 
 static ssize_t network_read_line(struct iio_context_pdata *pdata,
-		int desc, char *dst, size_t len)
+		void *io_data, char *dst, size_t len)
 {
 	size_t i;
 #ifdef __linux__
+	struct iio_network_io_context *io_ctx = io_data;
 	ssize_t ret;
 
-	ret = network_recv(desc, dst, len, MSG_PEEK);
+	ret = network_recv(io_ctx, dst, len, MSG_PEEK);
 	if (ret < 0)
 		return ret;
 
@@ -972,12 +1234,12 @@ static ssize_t network_read_line(struct iio_context_pdata *pdata,
 		return -EIO;
 
 	/* Advance the read offset to the byte following the \n */
-	return network_recv(desc, dst, i + 1, MSG_TRUNC);
+	return network_recv(io_ctx, dst, i + 1, MSG_TRUNC);
 #else
 	bool found = false;
 
 	for (i = 0; i < len - 1; i++) {
-		ssize_t ret = network_read_data(pdata, desc, dst + i, 1);
+		ssize_t ret = network_read_data(pdata, io_data, dst + i, 1);
 
 		if (ret < 0)
 			return ret;
@@ -1072,7 +1334,7 @@ struct iio_context * network_create_context(const char *host)
 		goto err_close_socket;
 	}
 
-	pdata->fd = fd;
+	pdata->io_ctx.fd = fd;
 	pdata->addrinfo = res;
 
 	pdata->lock = iio_mutex_create();
@@ -1087,7 +1349,7 @@ struct iio_context * network_create_context(const char *host)
 		goto err_destroy_mutex;
 
 	DEBUG("Creating context...\n");
-	ctx = iiod_client_create_context(pdata->iiod_client, fd);
+	ctx = iiod_client_create_context(pdata->iiod_client, &pdata->io_ctx);
 	if (!ctx)
 		goto err_destroy_iiod_client;
 
@@ -1148,7 +1410,7 @@ struct iio_context * network_create_context(const char *host)
 			goto err_free_description;
 		}
 
-		dev->pdata->fd = -1;
+		dev->pdata->io_ctx.fd = -1;
 #ifdef WITH_NETWORK_GET_BUFFER
 		dev->pdata->memfd = -1;
 #endif
@@ -1178,7 +1440,7 @@ struct iio_context * network_create_context(const char *host)
 		ctx->description = description;
 	}
 
-	iiod_client_set_timeout(pdata->iiod_client, fd,
+	iiod_client_set_timeout(pdata->iiod_client, &pdata->io_ctx,
 			calculate_remote_timeout(DEFAULT_TIMEOUT_MS));
 	return ctx;
 

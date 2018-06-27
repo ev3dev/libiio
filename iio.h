@@ -26,6 +26,7 @@
 extern "C" {
 #endif
 
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -69,8 +70,156 @@ struct iio_device;
 struct iio_channel;
 struct iio_buffer;
 
+struct iio_context_info;
+struct iio_scan_context;
+
+/**
+ * @enum iio_chan_type
+ * @brief IIO channel type
+ *
+ * A IIO channel has a type specifying the type of data associated with the
+ * channel.
+ */
+enum iio_chan_type {
+	IIO_VOLTAGE,
+	IIO_CURRENT,
+	IIO_POWER,
+	IIO_ACCEL,
+	IIO_ANGL_VEL,
+	IIO_MAGN,
+	IIO_LIGHT,
+	IIO_INTENSITY,
+	IIO_PROXIMITY,
+	IIO_TEMP,
+	IIO_INCLI,
+	IIO_ROT,
+	IIO_ANGL,
+	IIO_TIMESTAMP,
+	IIO_CAPACITANCE,
+	IIO_ALTVOLTAGE,
+	IIO_CCT,
+	IIO_PRESSURE,
+	IIO_HUMIDITYRELATIVE,
+	IIO_ACTIVITY,
+	IIO_STEPS,
+	IIO_ENERGY,
+	IIO_DISTANCE,
+	IIO_VELOCITY,
+	IIO_CONCENTRATION,
+	IIO_RESISTANCE,
+	IIO_PH,
+	IIO_CHAN_TYPE_UNKNOWN = INT_MAX
+};
+
+/**
+ * @enum iio_modifier
+ * @brief IIO channel modifier
+ *
+ * In a addition to a type a IIO channel can optionally have a channel modifier
+ * further specifying the data type of of the channel.
+ */
+enum iio_modifier {
+	IIO_NO_MOD,
+	IIO_MOD_X,
+	IIO_MOD_Y,
+	IIO_MOD_Z,
+	IIO_MOD_X_AND_Y,
+	IIO_MOD_X_AND_Z,
+	IIO_MOD_Y_AND_Z,
+	IIO_MOD_X_AND_Y_AND_Z,
+	IIO_MOD_X_OR_Y,
+	IIO_MOD_X_OR_Z,
+	IIO_MOD_Y_OR_Z,
+	IIO_MOD_X_OR_Y_OR_Z,
+	IIO_MOD_LIGHT_BOTH,
+	IIO_MOD_LIGHT_IR,
+	IIO_MOD_ROOT_SUM_SQUARED_X_Y,
+	IIO_MOD_SUM_SQUARED_X_Y_Z,
+	IIO_MOD_LIGHT_CLEAR,
+	IIO_MOD_LIGHT_RED,
+	IIO_MOD_LIGHT_GREEN,
+	IIO_MOD_LIGHT_BLUE,
+	IIO_MOD_QUATERNION,
+	IIO_MOD_TEMP_AMBIENT,
+	IIO_MOD_TEMP_OBJECT,
+	IIO_MOD_NORTH_MAGN,
+	IIO_MOD_NORTH_TRUE,
+	IIO_MOD_NORTH_MAGN_TILT_COMP,
+	IIO_MOD_NORTH_TRUE_TILT_COMP,
+	IIO_MOD_RUNNING,
+	IIO_MOD_JOGGING,
+	IIO_MOD_WALKING,
+	IIO_MOD_STILL,
+	IIO_MOD_ROOT_SUM_SQUARED_X_Y_Z,
+	IIO_MOD_I,
+	IIO_MOD_Q,
+	IIO_MOD_CO2,
+	IIO_MOD_VOC,
+};
 
 /* ---------------------------------------------------------------------------*/
+/* ------------------------- Scan functions ----------------------------------*/
+/** @defgroup Scan Functions for scanning available contexts
+ * @{
+ * @struct iio_scan_context
+ * @brief The scanning context
+ *
+ * @struct iio_context_info
+ * @brief The information related to a discovered context
+ */
+
+
+/** @brief Create a scan context
+ * @param backend A NULL-terminated string containing the backend to use for
+ * scanning. If NULL, all the available backends are used.
+ * @param flags Unused for now. Set to 0.
+ * @return on success, a pointer to a iio_scan_context structure
+ * @return On failure, NULL is returned and errno is set appropriately */
+__api struct iio_scan_context * iio_create_scan_context(
+		const char *backend, unsigned int flags);
+
+
+/** @brief Destroy the given scan context
+ * @param ctx A pointer to an iio_scan_context structure
+ *
+ * <b>NOTE:</b> After that function, the iio_scan_context pointer shall be invalid. */
+__api void iio_scan_context_destroy(struct iio_scan_context *ctx);
+
+
+/** @brief Enumerate available contexts
+ * @param ctx A pointer to an iio_scan_context structure
+ * @param info A pointer to a 'const struct iio_context_info **' typed variable.
+ * The pointed variable will be initialized on success.
+ * @returns On success, the number of contexts found.
+ * @returns On failure, a negative error number.
+ */
+__api ssize_t iio_scan_context_get_info_list(struct iio_scan_context *ctx,
+		struct iio_context_info ***info);
+
+
+/** @brief Free a context info list
+ * @param info A pointer to a 'const struct iio_context_info *' typed variable
+ */
+__api void iio_context_info_list_free(struct iio_context_info **info);
+
+
+/** @brief Get a description of a discovered context
+ * @param info A pointer to an iio_context_info structure
+ * @return A pointer to a static NULL-terminated string
+ */
+__api __pure const char * iio_context_info_get_description(
+		const struct iio_context_info *info);
+
+
+/** @brief Get the URI of a discovered context
+ * @param info A pointer to an iio_context_info structure
+ * @return A pointer to a static NULL-terminated string
+ */
+__api __pure const char * iio_context_info_get_uri(
+		const struct iio_context_info *info);
+
+
+/** @} *//* ------------------------------------------------------------------*/
 /* ------------------------- Top-level functions -----------------------------*/
 /** @defgroup TopLevel Top-level functions
  * @{ */
@@ -856,6 +1005,20 @@ __api void iio_channel_set_data(struct iio_channel *chn, void *data);
 __api void * iio_channel_get_data(const struct iio_channel *chn);
 
 
+/** @brief Get the type of the given channel
+ * @param chn A pointer to an iio_channel structure
+ * @return The type of the channel */
+__api __pure enum iio_chan_type iio_channel_get_type(
+		const struct iio_channel *chn);
+
+
+/** @brief Get the modifier type of the given channel
+ * @param chn A pointer to an iio_channel structure
+ * @return The modifier type of the channel */
+__api __pure enum iio_modifier iio_channel_get_modifier(
+		const struct iio_channel *chn);
+
+
 /** @} *//* ------------------------------------------------------------------*/
 /* ------------------------- Buffer functions --------------------------------*/
 /** @defgroup Buffer Buffer
@@ -941,6 +1104,31 @@ __api ssize_t iio_buffer_push(struct iio_buffer *buf);
  * <b>NOTE:</b> Only valid for output buffers */
 __api ssize_t iio_buffer_push_partial(struct iio_buffer *buf,
 		size_t samples_count);
+
+/** @brief Cancel all buffer operations
+ * @param buf The buffer for which operations should be canceled
+ *
+ * This function cancels all outstanding buffer operations previously scheduled.
+ * This means any pending iio_buffer_push() or iio_buffer_refill() operation
+ * will abort and return immediately, any further invocations of these functions
+ * on the same buffer will return immediately with an error.
+ *
+ * Usually iio_buffer_push() and iio_buffer_refill() will block until either all
+ * data has been transferred or a timeout occurs. This can depending on the
+ * configuration take a significant amount of time. iio_buffer_cancel() is
+ * useful to bypass these conditions if the buffer operation is supposed to be
+ * stopped in response to an external event (e.g. user input).
+ *
+ * To be able to capture additional data after calling this function the buffer
+ * should be destroyed and then re-created.
+ *
+ * This function can be called multiple times for the same buffer, but all but
+ * the first invocation will be without additional effect.
+ *
+ * This function is thread-safe, but not signal-safe, i.e. it must not be called
+ * from a signal handler.
+ */
+__api void iio_buffer_cancel(struct iio_buffer *buf);
 
 
 /** @brief Get the start address of the buffer
