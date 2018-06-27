@@ -22,6 +22,7 @@
 #include "../iio.h"
 #include "queue.h"
 
+#include <endian.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -33,6 +34,20 @@
 #if WITH_AIO
 #include <libaio.h>
 #endif
+
+#ifndef __bswap_constant_16
+#define __bswap_constant_16(x) \
+	((unsigned short int) ((((x) >> 8) & 0xff) | (((x) & 0xff) << 8)))
+#endif
+
+#ifndef __bswap_constant_32
+#define __bswap_constant_32(x) \
+	((((x) & 0xff000000) >> 24) | (((x) & 0x00ff0000) >>  8) | \
+	 (((x) & 0x0000ff00) <<  8) | (((x) & 0x000000ff) << 24))
+#endif
+
+struct thread_pool;
+extern struct thread_pool *main_thread_pool;
 
 struct parser_pdata {
 	struct iio_context *ctx;
@@ -49,20 +64,22 @@ struct parser_pdata {
 #if WITH_AIO
 	io_context_t aio_ctx;
 	int aio_eventfd;
+	pthread_mutex_t aio_mutex;
 #endif
+	struct thread_pool *pool;
 
 	ssize_t (*writefd)(struct parser_pdata *pdata, const void *buf, size_t len);
 	ssize_t (*readfd)(struct parser_pdata *pdata, void *buf, size_t len);
 };
 
 extern bool server_demux; /* Defined in iiod.c */
-extern int stop_fd;
-
-void thread_started(void);
-void thread_stopped(void);
 
 void interpreter(struct iio_context *ctx, int fd_in, int fd_out, bool verbose,
-	bool is_socket, bool use_aio);
+	bool is_socket, bool use_aio, struct thread_pool *pool);
+
+int start_usb_daemon(struct iio_context *ctx, const char *ffs,
+		bool debug, bool use_aio, unsigned int nb_pipes,
+		struct thread_pool *pool);
 
 int open_dev(struct parser_pdata *pdata, struct iio_device *dev,
 		size_t samples_count, const char *mask, bool cyclic);
@@ -90,23 +107,12 @@ int set_buffers_count(struct parser_pdata *pdata,
 		struct iio_device *dev, long value);
 
 ssize_t read_line(struct parser_pdata *pdata, char *buf, size_t len);
-
-static __inline__ ssize_t writefd(struct parser_pdata *pdata,
-		const void *buf, size_t len)
-{
-	return pdata->writefd(pdata, buf, len);
-}
+ssize_t write_all(struct parser_pdata *pdata, const void *src, size_t len);
 
 static __inline__ void output(struct parser_pdata *pdata, const char *text)
 {
-	if (writefd(pdata, text, strlen(text)) <= 0)
+	if (write_all(pdata, text, strlen(text)) <= 0)
 		pdata->stop = true;
-}
-
-static __inline__ ssize_t readfd(struct parser_pdata *pdata,
-		void *buf, size_t len)
-{
-	return pdata->readfd(pdata, buf, len);
 }
 
 static __inline__ int poll_nointr(struct pollfd *pfd, unsigned int num_pfd)

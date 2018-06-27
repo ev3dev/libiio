@@ -27,19 +27,31 @@ extern "C" {
 #endif
 
 #include <limits.h>
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <sys/types.h>
 #include <stddef.h>
 
-#ifdef _MSC_BUILD
-/* Come on Microsoft, time to get some C99... */
-typedef long ssize_t;
+#if (defined(_WIN32) || defined(__MBED__))
+#ifndef _SSIZE_T_DEFINED
+typedef ptrdiff_t ssize_t;
 #define _SSIZE_T_DEFINED
 #endif
+#else
+#include <sys/types.h>
+#endif
 
-#ifdef __GNUC__
+#if defined(_MSC_VER) && (_MSC_VER < 1800) && !defined(__BOOL_DEFINED)
+#undef bool
+#undef false
+#undef true
+#define bool char
+#define false 0
+#define true 1
+#else
+#include <stdbool.h>
+#endif
+
+#if defined(__GNUC__) && !defined(MATLAB_MEX_FILE) && !defined(MATLAB_LOADLIBRARY)
 #ifndef __cnst
 #define __cnst __attribute__((const))
 #endif
@@ -59,7 +71,7 @@ typedef long ssize_t;
 #   else
 #	define __api __declspec(dllimport)
 #   endif
-#elif __GNUC__ >= 4
+#elif __GNUC__ >= 4 && !defined(MATLAB_MEX_FILE) && !defined(MATLAB_LOADLIBRARY)
 #   define __api __attribute__((visibility ("default")))
 #else
 #   define __api
@@ -241,6 +253,30 @@ __api void iio_library_get_version(unsigned int *major,
 __api void iio_strerror(int err, char *dst, size_t len);
 
 
+/** @brief Check if the specified backend is available
+ * @param backend The name of the backend to query
+ * @return True if the backend is available, false otherwise
+ *
+ * Introduced in version 0.9. */
+__api __cnst bool iio_has_backend(const char *backend);
+
+
+/** @brief Get the number of available backends
+ * @return The number of available backends
+ *
+ * Introduced in version 0.9. */
+__api __cnst unsigned int iio_get_backends_count(void);
+
+
+/** @brief Retrieve the name of a given backend
+ * @param index The index corresponding to the attribute
+ * @return On success, a pointer to a static NULL-terminated string
+ * @return If the index is invalid, NULL is returned
+ *
+ * Introduced in version 0.9. */
+__api __cnst const char * iio_get_backend(unsigned int index);
+
+
 /** @} *//* ------------------------------------------------------------------*/
 /* ------------------------- Context functions -------------------------------*/
 /** @defgroup Context Context
@@ -352,6 +388,41 @@ __api __pure const char * iio_context_get_name(const struct iio_context *ctx);
  * the current context. */
 __api __pure const char * iio_context_get_description(
 		const struct iio_context *ctx);
+
+
+/** @brief Get the number of context-specific attributes
+ * @param ctx A pointer to an iio_context structure
+ * @return The number of context-specific attributes
+ *
+ * Introduced in version 0.9. */
+__api __pure unsigned int iio_context_get_attrs_count(
+		const struct iio_context *ctx);
+
+
+/** @brief Retrieve the name and value of a context-specific attribute
+ * @param ctx A pointer to an iio_context structure
+ * @param index The index corresponding to the attribute
+ * @param name A pointer to a const char * pointer (NULL accepted)
+ * @param value A pointer to a const char * pointer (NULL accepted)
+ * @return On success, 0 is returned
+ * @return On error, a negative errno code is returned
+ *
+ * Introduced in version 0.9. */
+__api int iio_context_get_attr(
+		const struct iio_context *ctx, unsigned int index,
+		const char **name, const char **value);
+
+
+/** @brief Retrieve the value of a context-specific attribute
+ * @param ctx A pointer to an iio_context structure
+ * @param name The name of the context attribute to read
+ * @return On success, a pointer to a static NULL-terminated string
+ * @return If the name does not correspond to any attribute, NULL is
+ * returned
+ *
+ * Introduced in version 0.9. */
+__api const char * iio_context_get_attr_value(
+		const struct iio_context *ctx, const char *name);
 
 
 /** @brief Enumerate the devices found in the given context
@@ -1065,7 +1136,7 @@ __api int iio_buffer_get_poll_fd(struct iio_buffer *buf);
 
 /** @brief Make iio_buffer_refill() and iio_buffer_push() blocking or not
  *
- * After this function has been called with blocking == true,
+ * After this function has been called with blocking == false,
  * iio_buffer_refill() and iio_buffer_push() will return -EAGAIN if no data is
  * ready.
  * A device is blocking by default.
@@ -1174,6 +1245,7 @@ __api void * iio_buffer_end(const struct iio_buffer *buf);
  * @param buf A pointer to an iio_buffer structure
  * @param callback A pointer to a function to call for each sample found
  * @param data A user-specified pointer that will be passed to the callback
+ * @return number of bytes processed.
  *
  * <b>NOTE:</b> The callback receives four arguments:
  * * A pointer to the iio_channel structure corresponding to the sample,
@@ -1232,6 +1304,9 @@ struct iio_data_format {
 
 	/** @brief Contains the scale to apply if with_scale is set */
 	double scale;
+
+	/** @brief Number of times length repeats (added in v0.8) */
+	unsigned int repeat;
 };
 
 

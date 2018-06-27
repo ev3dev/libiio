@@ -31,9 +31,9 @@ static int add_attr_to_channel(struct iio_channel *chn, xmlNode *n)
 
 	for (attr = n->properties; attr; attr = attr->next) {
 		if (!strcmp((char *) attr->name, "name")) {
-			name = _strdup((char *) attr->children->content);
+			name = iio_strdup((char *) attr->children->content);
 		} else if (!strcmp((char *) attr->name, "filename")) {
-			filename = _strdup((char *) attr->children->content);
+			filename = iio_strdup((char *) attr->children->content);
 		} else {
 			WARNING("Unknown field \'%s\' in channel %s\n",
 					attr->name, chn->id);
@@ -46,7 +46,7 @@ static int add_attr_to_channel(struct iio_channel *chn, xmlNode *n)
 	}
 
 	if (!filename) {
-		filename = _strdup(name);
+		filename = iio_strdup(name);
 		if (!filename)
 			goto err_free;
 	}
@@ -76,7 +76,7 @@ static int add_attr_to_device(struct iio_device *dev, xmlNode *n, bool is_debug)
 
 	for (attr = n->properties; attr; attr = attr->next) {
 		if (!strcmp((char *) attr->name, "name")) {
-			name = _strdup((char *) attr->children->content);
+			name = iio_strdup((char *) attr->children->content);
 		} else {
 			WARNING("Unknown field \'%s\' in device %s\n",
 					attr->name, dev->id);
@@ -123,10 +123,19 @@ static void setup_scan_element(struct iio_channel *chn, xmlNode *n)
 			chn->index = atol(content);
 		} else if (!strcmp(name, "format")) {
 			char e, s;
-			sscanf(content, "%ce:%c%u/%u>>%u", &e, &s,
+			if (strchr(content, 'X')) {
+				sscanf(content, "%ce:%c%u/%uX%u>>%u", &e, &s,
+					&chn->format.bits,
+					&chn->format.length,
+					&chn->format.repeat,
+					&chn->format.shift);
+			} else {
+				chn->format.repeat = 1;
+				sscanf(content, "%ce:%c%u/%u>>%u", &e, &s,
 					&chn->format.bits,
 					&chn->format.length,
 					&chn->format.shift);
+			}
 			chn->format.is_be = e == 'b';
 			chn->format.is_signed = (s == 's' || s == 'S');
 			chn->format.is_fully_defined = (s == 'S' || s == 'U' ||
@@ -157,9 +166,9 @@ static struct iio_channel * create_channel(struct iio_device *dev, xmlNode *n)
 		const char *name = (const char *) attr->name,
 		      *content = (const char *) attr->children->content;
 		if (!strcmp(name, "name")) {
-			chn->name = _strdup(content);
+			chn->name = iio_strdup(content);
 		} else if (!strcmp(name, "id")) {
-			chn->id = _strdup(content);
+			chn->id = iio_strdup(content);
 		} else if (!strcmp(name, "type")) {
 			if (!strcmp(content, "output"))
 				chn->is_output = true;
@@ -210,9 +219,10 @@ static struct iio_device * create_device(struct iio_context *ctx, xmlNode *n)
 
 	for (attr = n->properties; attr; attr = attr->next) {
 		if (!strcmp((char *) attr->name, "name")) {
-			dev->name = _strdup((char *) attr->children->content);
+			dev->name = iio_strdup(
+					(char *) attr->children->content);
 		} else if (!strcmp((char *) attr->name, "id")) {
-			dev->id = _strdup((char *) attr->children->content);
+			dev->id = iio_strdup((char *) attr->children->content);
 		} else {
 			WARNING("Unknown attribute \'%s\' in <device>\n",
 					attr->name);
@@ -281,12 +291,31 @@ static const struct iio_backend_ops xml_ops = {
 	.clone = xml_clone,
 };
 
+static int parse_context_attr(struct iio_context *ctx, xmlNode *n)
+{
+	xmlAttr *attr;
+	const char *name = NULL, *value = NULL;
+
+	for (attr = n->properties; attr; attr = attr->next) {
+		if (!strcmp((const char *) attr->name, "name")) {
+			name = (const char *) attr->children->content;
+		} else if (!strcmp((const char *) attr->name, "value")) {
+			value = (const char *) attr->children->content;
+		}
+	}
+
+	if (!name || !value)
+		return -EINVAL;
+	else
+		return iio_context_add_attr(ctx, name, value);
+}
+
 static struct iio_context * iio_create_xml_context_helper(xmlDoc *doc)
 {
 	unsigned int i;
 	xmlNode *root, *n;
 	xmlAttr *attr;
-	int err = ENOMEM;
+	int err = -ENOMEM;
 	struct iio_context *ctx = zalloc(sizeof(*ctx));
 	if (!ctx)
 		goto err_set_errno;
@@ -297,13 +326,13 @@ static struct iio_context * iio_create_xml_context_helper(xmlDoc *doc)
 	root = xmlDocGetRootElement(doc);
 	if (strcmp((char *) root->name, "context")) {
 		ERROR("Unrecognized XML file\n");
-		err = EINVAL;
+		err = -EINVAL;
 		goto err_free_ctx;
 	}
 
 	for (attr = root->properties; attr; attr = attr->next) {
 		if (!strcmp((char *) attr->name, "description"))
-			ctx->description = _strdup(
+			ctx->description = iio_strdup(
 					(char *) attr->children->content);
 		else if (strcmp((char *) attr->name, "name"))
 			WARNING("Unknown parameter \'%s\' in <context>\n",
@@ -313,7 +342,13 @@ static struct iio_context * iio_create_xml_context_helper(xmlDoc *doc)
 	for (n = root->children; n; n = n->next) {
 		struct iio_device **devs, *dev;
 
-		if (strcmp((char *) n->name, "device")) {
+		if (!strcmp((char *) n->name, "context-attribute")) {
+			err = parse_context_attr(ctx, n);
+			if (err)
+				goto err_free_devices;
+			else
+				continue;
+		} else if (strcmp((char *) n->name, "device")) {
 			if (strcmp((char *) n->name, "text"))
 				WARNING("Unknown children \'%s\' in "
 						"<context>\n", n->name);
@@ -349,10 +384,16 @@ err_free_devices:
 		free_device(ctx->devices[i]);
 	if (ctx->nb_devices)
 		free(ctx->devices);
+	for (i = 0; i < ctx->nb_attrs; i++) {
+		free(ctx->attrs[i]);
+		free(ctx->values[i]);
+	}
+	free(ctx->attrs);
+	free(ctx->values);
 err_free_ctx:
 	free(ctx);
 err_set_errno:
-	errno = err;
+	errno = -err;
 	return NULL;
 }
 
@@ -366,6 +407,7 @@ struct iio_context * xml_create_context(const char *xml_file)
 	doc = xmlReadFile(xml_file, NULL, XML_PARSE_DTDVALID);
 	if (!doc) {
 		ERROR("Unable to parse XML file\n");
+		errno = EINVAL;
 		return NULL;
 	}
 
@@ -384,6 +426,7 @@ struct iio_context * xml_create_context_mem(const char *xml, size_t len)
 	doc = xmlReadMemory(xml, (int) len, NULL, NULL, XML_PARSE_DTDVALID);
 	if (!doc) {
 		ERROR("Unable to parse XML file\n");
+		errno = EINVAL;
 		return NULL;
 	}
 

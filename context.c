@@ -17,6 +17,7 @@
  * */
 
 #include "debug.h"
+#include "iio-config.h"
 #include "iio-private.h"
 
 #include <errno.h>
@@ -29,13 +30,15 @@
 
 static const char xml_header[] = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
 "<!DOCTYPE context ["
-"<!ELEMENT context (device)*>"
+"<!ELEMENT context (device | context-attribute)*>"
+"<!ELEMENT context-attribute EMPTY>"
 "<!ELEMENT device (channel | attribute | debug-attribute)*>"
 "<!ELEMENT channel (scan-element?, attribute*)>"
 "<!ELEMENT attribute EMPTY>"
 "<!ELEMENT scan-element EMPTY>"
 "<!ELEMENT debug-attribute EMPTY>"
 "<!ATTLIST context name CDATA #REQUIRED description CDATA #IMPLIED>"
+"<!ATTLIST context-attribute name CDATA #REQUIRED value CDATA #REQUIRED>"
 "<!ATTLIST device id CDATA #REQUIRED name CDATA #IMPLIED>"
 "<!ATTLIST channel id CDATA #REQUIRED type (input|output) #REQUIRED name CDATA #IMPLIED>"
 "<!ATTLIST scan-element index CDATA #REQUIRED format CDATA #REQUIRED scale CDATA #IMPLIED>"
@@ -46,8 +49,8 @@ static const char xml_header[] = "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
 /* Returns a string containing the XML representation of this context */
 char * iio_context_create_xml(const struct iio_context *ctx)
 {
-	size_t len, *devices_len;
-	char *str, *ptr, **devices;
+	size_t len, *devices_len = NULL;
+	char *str, *ptr, **devices = NULL;
 	unsigned int i;
 
 	len = strlen(ctx->name) + sizeof(xml_header) - 1 +
@@ -56,41 +59,30 @@ char * iio_context_create_xml(const struct iio_context *ctx)
 		len += strlen(ctx->description) +
 			sizeof(" description=\"\"") - 1;
 
-	if (!ctx->nb_devices) {
-		str = malloc(len);
-		if (!str) {
+	for (i = 0; i < ctx->nb_attrs; i++)
+		len += strlen(ctx->attrs[i]) +
+			strlen(ctx->values[i]) +
+			sizeof("<context-attribute name=\"\" value=\"\" />");
+
+	if (ctx->nb_devices) {
+		devices_len = malloc(ctx->nb_devices * sizeof(*devices_len));
+		if (!devices_len) {
 			errno = ENOMEM;
 			return NULL;
 		}
 
-		if (ctx->description)
-			snprintf(str, len, "%s<context name=\"%s\" "
-					"description=\"%s\" ></context>",
-					xml_header, ctx->name,
-					ctx->description);
-		else
-			snprintf(str, len, "%s<context name=\"%s\" ></context>",
-					xml_header, ctx->name);
-		return str;
-	}
+		devices = calloc(ctx->nb_devices, sizeof(*devices));
+		if (!devices)
+			goto err_free_devices_len;
 
-	devices_len = malloc(ctx->nb_devices * sizeof(*devices_len));
-	if (!devices_len) {
-		errno = ENOMEM;
-		return NULL;
-	}
-
-	devices = malloc(ctx->nb_devices * sizeof(*devices));
-	if (!devices)
-		goto err_free_devices_len;
-
-	for (i = 0; i < ctx->nb_devices; i++) {
-		char *xml = iio_device_get_xml(ctx->devices[i],
-				&devices_len[i]);
-		if (!xml)
-			goto err_free_devices;
-		devices[i] = xml;
-		len += devices_len[i];
+		for (i = 0; i < ctx->nb_devices; i++) {
+			char *xml = iio_device_get_xml(ctx->devices[i],
+					&devices_len[i]);
+			if (!xml)
+				goto err_free_devices;
+			devices[i] = xml;
+			len += devices_len[i];
+		}
 	}
 
 	str = malloc(len);
@@ -99,14 +91,21 @@ char * iio_context_create_xml(const struct iio_context *ctx)
 		goto err_free_devices;
 	}
 
-	if (ctx->description)
-		snprintf(str, len, "%s<context name=\"%s\" "
+	if (ctx->description) {
+		iio_snprintf(str, len, "%s<context name=\"%s\" "
 				"description=\"%s\" >",
 				xml_header, ctx->name, ctx->description);
-	else
-		snprintf(str, len, "%s<context name=\"%s\" >",
+	} else {
+		iio_snprintf(str, len, "%s<context name=\"%s\" >",
 				xml_header, ctx->name);
+	}
+
 	ptr = strrchr(str, '\0');
+
+	for (i = 0; i < ctx->nb_attrs; i++)
+		ptr += sprintf(ptr, "<context-attribute name=\"%s\" value=\"%s\" />",
+				ctx->attrs[i], ctx->values[i]);
+
 
 	for (i = 0; i < ctx->nb_devices; i++) {
 		strcpy(ptr, devices[i]);
@@ -120,7 +119,7 @@ char * iio_context_create_xml(const struct iio_context *ctx)
 	return str;
 
 err_free_devices:
-	while (i--)
+	for (i = 0; i < ctx->nb_devices; i++)
 		free(devices[i]);
 	free(devices);
 err_free_devices_len:
@@ -152,6 +151,14 @@ void iio_context_destroy(struct iio_context *ctx)
 	if (ctx->ops->shutdown)
 		ctx->ops->shutdown(ctx);
 
+	for (i = 0; i < ctx->nb_attrs; i++) {
+		free(ctx->attrs[i]);
+		free(ctx->values[i]);
+	}
+	if (ctx->nb_attrs) {
+		free(ctx->attrs);
+		free(ctx->values);
+	}
 	for (i = 0; i < ctx->nb_devices; i++)
 		free_device(ctx->devices[i]);
 	if (ctx->nb_devices)
@@ -216,6 +223,9 @@ static void reorder_channels(struct iio_device *dev)
 			}
 		}
 	} while (found);
+
+	for (i = 0; i < dev->nb_channels; i++)
+		dev->channels[i]->number = i;
 }
 
 int iio_context_init(struct iio_context *ctx)
@@ -264,27 +274,27 @@ struct iio_context * iio_context_clone(const struct iio_context *ctx)
 
 struct iio_context * iio_create_context_from_uri(const char *uri)
 {
-#if LOCAL_BACKEND
+#ifdef WITH_LOCAL_BACKEND
 	if (strcmp(uri, "local:") == 0) /* No address part */
 		return iio_create_local_context();
 #endif
 
-#if XML_BACKEND
+#ifdef WITH_XML_BACKEND
 	if (strncmp(uri, "xml:", sizeof("xml:") - 1) == 0)
 		return iio_create_xml_context(uri + sizeof("xml:") - 1);
 #endif
 
-#if NETWORK_BACKEND
+#ifdef WITH_NETWORK_BACKEND
 	if (strncmp(uri, "ip:", sizeof("ip:") - 1) == 0)
 		return iio_create_network_context(uri+3);
 #endif
 
-#if USB_BACKEND
+#ifdef WITH_USB_BACKEND
 	if (strncmp(uri, "usb:", sizeof("usb:") - 1) == 0)
 		return usb_create_context_from_uri(uri);
 #endif
 
-#if SERIAL_BACKEND
+#ifdef WITH_SERIAL_BACKEND
 	if (strncmp(uri, "serial:", sizeof("serial:") - 1) == 0)
 		return serial_create_context_from_uri(uri);
 #endif
@@ -304,7 +314,7 @@ struct iio_context * iio_create_default_context(void)
 		if (ctx)
 			return ctx;
 
-#if NETWORK_BACKEND
+#ifdef WITH_NETWORK_BACKEND
 		/* If the environment variable is an empty string, we will
 		 * discover the server using ZeroConf */
 		if (strlen(hostname) == 0)
@@ -319,7 +329,7 @@ struct iio_context * iio_create_default_context(void)
 
 struct iio_context * iio_create_local_context(void)
 {
-#if LOCAL_BACKEND
+#ifdef WITH_LOCAL_BACKEND
 	return local_create_context();
 #else
 	errno = ENOSYS;
@@ -329,7 +339,7 @@ struct iio_context * iio_create_local_context(void)
 
 struct iio_context * iio_create_network_context(const char *hostname)
 {
-#if NETWORK_BACKEND
+#ifdef WITH_NETWORK_BACKEND
 	return network_create_context(hostname);
 #else
 	errno = ENOSYS;
@@ -339,7 +349,7 @@ struct iio_context * iio_create_network_context(const char *hostname)
 
 struct iio_context * iio_create_xml_context_mem(const char *xml, size_t len)
 {
-#if XML_BACKEND
+#ifdef WITH_XML_BACKEND
 	return xml_create_context_mem(xml, len);
 #else
 	errno = ENOSYS;
@@ -349,10 +359,76 @@ struct iio_context * iio_create_xml_context_mem(const char *xml, size_t len)
 
 struct iio_context * iio_create_xml_context(const char *xml_file)
 {
-#if XML_BACKEND
+#ifdef WITH_XML_BACKEND
 	return xml_create_context(xml_file);
 #else
 	errno = ENOSYS;
 	return NULL;
 #endif
+}
+
+unsigned int iio_context_get_attrs_count(const struct iio_context *ctx)
+{
+	return ctx->nb_attrs;
+}
+
+int iio_context_get_attr(const struct iio_context *ctx, unsigned int index,
+		const char **name, const char **value)
+{
+	if (index >= ctx->nb_attrs)
+		return -EINVAL;
+
+	if (name)
+		*name = ctx->attrs[index];
+	if (value)
+		*value = ctx->values[index];
+	return 0;
+}
+
+const char * iio_context_get_attr_value(
+		const struct iio_context *ctx, const char *name)
+{
+	unsigned int i;
+
+	for (i = 0; i < ctx->nb_attrs; i++) {
+		if (!strcmp(name, ctx->attrs[i]))
+			return ctx->values[i];
+	}
+
+	return NULL;
+}
+
+int iio_context_add_attr(struct iio_context *ctx,
+		const char *key, const char *value)
+{
+	char **attrs, **values, *new_key, *new_val;
+
+	attrs = realloc(ctx->attrs,
+			(ctx->nb_attrs + 1) * sizeof(*ctx->attrs));
+	if (!attrs)
+		return -ENOMEM;
+
+	ctx->attrs = attrs;
+
+	values = realloc(ctx->values,
+			(ctx->nb_attrs + 1) * sizeof(*ctx->values));
+	if (!values)
+		return -ENOMEM;
+
+	ctx->values = values;
+
+	new_key = iio_strdup(key);
+	if (!new_key)
+		return -ENOMEM;
+
+	new_val = iio_strdup(value);
+	if (!new_val) {
+		free(new_key);
+		return -ENOMEM;
+	}
+
+	ctx->attrs[ctx->nb_attrs] = new_key;
+	ctx->values[ctx->nb_attrs] = new_val;
+	ctx->nb_attrs++;
+	return 0;
 }

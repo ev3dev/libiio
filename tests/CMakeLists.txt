@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 2.8.7)
 
 project(iio_genxml  C)
 project(iio_info    C)
+project(iio_attr    C)
 project(iio_readdev C)
 project(iio_reg     C)
 
@@ -12,21 +13,25 @@ endif (MSVC)
 
 add_executable(iio_genxml  iio_genxml.c   ${GETOPT_C_FILE})
 add_executable(iio_info    iio_info.c     ${GETOPT_C_FILE})
+add_executable(iio_attr    iio_attr.c     ${GETOPT_C_FILE})
 add_executable(iio_readdev iio_readdev.c  ${GETOPT_C_FILE})
 add_executable(iio_reg     iio_reg.c      ${GETOPT_C_FILE})
 
 target_link_libraries(iio_genxml  iio)
 target_link_libraries(iio_info    iio)
-target_link_libraries(iio_readdev iio ${PTHREAD_LIBRARIES})
+target_link_libraries(iio_attr    iio)
+target_link_libraries(iio_readdev iio)
 target_link_libraries(iio_reg     iio)
 
-set(IIO_TESTS_TARGETS iio_genxml iio_info iio_readdev iio_reg)
+set(IIO_TESTS_TARGETS iio_genxml iio_info iio_attr iio_readdev iio_reg)
 
 if(PTHREAD_LIBRARIES)
 	project(iio_adi_xflow_check C)
 	add_executable(iio_adi_xflow_check iio_adi_xflow_check.c)
 	target_link_libraries(iio_adi_xflow_check iio ${PTHREAD_LIBRARIES})
 	set(IIO_TESTS_TARGETS ${IIO_TESTS_TARGETS} iio_adi_xflow_check)
+
+	target_link_libraries(iio_readdev ${PTHREAD_LIBRARIES})
 endif()
 
 set_target_properties(${IIO_TESTS_TARGETS} PROPERTIES
@@ -36,5 +41,12 @@ set_target_properties(${IIO_TESTS_TARGETS} PROPERTIES
 )
 
 if(NOT SKIP_INSTALL_ALL)
-	install(TARGETS ${IIO_TESTS_TARGETS} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+	if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+		install(TARGETS ${IIO_TESTS_TARGETS} RUNTIME DESTINATION /Library/Frameworks/iio.framework/Tools)
+	else()
+		install(TARGETS ${IIO_TESTS_TARGETS} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+	endif()
 endif()
+
+# Make the test targets available to the main CMakeLists.txt
+set(IIO_TESTS_TARGETS ${IIO_TESTS_TARGETS} PARENT_SCOPE)

@@ -18,10 +18,11 @@
 
 #include "../debug.h"
 #include "../iio.h"
+#include "../iio-config.h"
 #include "ops.h"
+#include "thread-pool.h"
 
 #include <arpa/inet.h>
-#include <endian.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -47,17 +48,6 @@
 
 #define IIOD_PORT 30431
 
-#ifndef __bswap_constant_16
-#define __bswap_constant_16(x) \
-	((unsigned short int) ((((x) >> 8) & 0xff) | (((x) & 0xff) << 8)))
-#endif
-
-#ifndef __bswap_constant_32
-#define __bswap_constant_32(x) \
-	((((x) & 0xff000000) >> 24) | (((x) & 0x00ff0000) >>  8) | \
-	 (((x) & 0x0000ff00) <<  8) | (((x) & 0x000000ff) << 24))
-#endif
-
 struct client_data {
 	int fd;
 	bool debug;
@@ -66,51 +56,8 @@ struct client_data {
 
 bool server_demux;
 
-/*
- * Eventfd that is used to signal all threads that the iiod has been asked to
- * stop and the threads should release all resources and stop.
- */
-int stop_fd;
+struct thread_pool *main_thread_pool;
 
-/*
- * This is used to make sure that all active threads have finished cleanup when
- * a STOP event is received. We don't use pthread_join() since for most threads
- * we are OK with them exiting asynchronously and there really is no place to
- * call pthread_join() to free the thread's resources. We only need to
- * synchronize the threads that are still active when the iiod is shutdown to
- * give them a chance to release all resources, disable buffers etc, before
- * iio_context_destroy() is called.
- *
- * In order to avoid race conditions thread_started() must be called before
- * the thread is created and thread_stopped() must be called right before
- * leaving the thread.
- */
-static pthread_mutex_t thread_count_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t thread_count_cond = PTHREAD_COND_INITIALIZER;
-static unsigned int thread_count;
-
-void thread_started(void)
-{
-	pthread_mutex_lock(&thread_count_lock);
-	thread_count++;
-	pthread_mutex_unlock(&thread_count_lock);
-}
-
-void thread_stopped(void)
-{
-	pthread_mutex_lock(&thread_count_lock);
-	thread_count--;
-	pthread_cond_signal(&thread_count_cond);
-	pthread_mutex_unlock(&thread_count_lock);
-}
-
-static void wait_for_threads(void)
-{
-	pthread_mutex_lock(&thread_count_lock);
-	while (thread_count)
-		pthread_cond_wait(&thread_count_cond, &thread_count_lock);
-	pthread_mutex_unlock(&thread_count_lock);
-}
 
 static struct sockaddr_in sockaddr = {
 	.sin_family = AF_INET,
@@ -142,6 +89,8 @@ static const struct option options[] = {
 	  {"demux", no_argument, 0, 'D'},
 	  {"interactive", no_argument, 0, 'i'},
 	  {"aio", no_argument, 0, 'a'},
+	  {"ffs", required_argument, 0, 'F'},
+	  {"nb-pipes", required_argument, 0, 'n'},
 	  {0, 0, 0, 0},
 };
 
@@ -152,6 +101,8 @@ static const char *options_descriptions[] = {
 	"Demux channels directly on the server.",
 	"Run " MY_NAME " in the controlling terminal.",
 	"Use asynchronous I/O.",
+	"Use the given FunctionFS mountpoint to serve over USB",
+	"Specify the number of USB pipes (ep couples) to use",
 };
 
 #ifdef HAVE_AVAHI
@@ -221,18 +172,16 @@ static void usage(void)
 					options_descriptions[i]);
 }
 
-static void * client_thd(void *d)
+static void client_thd(struct thread_pool *pool, void *d)
 {
 	struct client_data *cdata = d;
 
-	interpreter(cdata->ctx, cdata->fd, cdata->fd, cdata->debug, true, false);
+	interpreter(cdata->ctx, cdata->fd, cdata->fd, cdata->debug,
+			true, false, pool);
 
 	INFO("Client exited\n");
 	close(cdata->fd);
 	free(cdata);
-	thread_stopped();
-
-	return NULL;
 }
 
 static void set_handler(int signal, void (*handler)(int))
@@ -245,22 +194,12 @@ static void set_handler(int signal, void (*handler)(int))
 
 static void sig_handler(int sig)
 {
-	uint64_t ev = 1;
-	int ret;
-
-	ret = write(stop_fd, &ev, sizeof(ev));
-	if (ret < 0) {
-		ERROR("Failed to shutdown cleanly\n");
-		exit(EXIT_FAILURE);
-	}
+	thread_pool_stop(main_thread_pool);
 }
 
 static int main_interactive(struct iio_context *ctx, bool verbose, bool use_aio)
 {
 	int flags;
-
-	/* Specify that we will read sequentially the input FD */
-	posix_fadvise(STDIN_FILENO, 0, 0, POSIX_FADV_SEQUENTIAL);
 
 	if (!use_aio) {
 		flags = fcntl(STDIN_FILENO, F_GETFL);
@@ -269,7 +208,8 @@ static int main_interactive(struct iio_context *ctx, bool verbose, bool use_aio)
 		fcntl(STDOUT_FILENO, F_SETFL, flags | O_NONBLOCK);
 	}
 
-	interpreter(ctx, STDIN_FILENO, STDOUT_FILENO, verbose, false, use_aio);
+	interpreter(ctx, STDIN_FILENO, STDOUT_FILENO, verbose,
+			false, use_aio, main_thread_pool);
 	return EXIT_SUCCESS;
 }
 
@@ -280,7 +220,6 @@ static int main_server(struct iio_context *ctx, bool debug)
 	    keepalive_intvl = 10,
 	    keepalive_probes = 6;
 	struct pollfd pfd[2];
-	pthread_attr_t attr;
 	char err_str[1024];
 	bool ipv6;
 #ifdef HAVE_AVAHI
@@ -330,21 +269,16 @@ static int main_server(struct iio_context *ctx, bool debug)
 	avahi_started = !start_avahi();
 #endif
 
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-
 	pfd[0].fd = fd;
 	pfd[0].events = POLLIN;
 	pfd[0].revents = 0;
-	pfd[1].fd = stop_fd;
+	pfd[1].fd = thread_pool_get_poll_fd(main_thread_pool);
 	pfd[1].events = POLLIN;
 	pfd[1].revents = 0;
 
 	while (true) {
-		pthread_t thd;
 		struct client_data *cdata;
 		struct sockaddr_in caddr;
-		sigset_t sigmask, oldsigmask;
 		socklen_t addr_len = sizeof(caddr);
 		int new;
 
@@ -389,22 +323,16 @@ static int main_server(struct iio_context *ctx, bool debug)
 
 		INFO("New client connected from %s\n",
 				inet_ntoa(caddr.sin_addr));
-		sigfillset(&sigmask);
-		pthread_sigmask(SIG_BLOCK, &sigmask, &oldsigmask);
-		thread_started();
-		ret = pthread_create(&thd, &attr, client_thd, cdata);
-		pthread_sigmask(SIG_SETMASK, &oldsigmask, NULL);
+
+		ret = thread_pool_add_thread(main_thread_pool, client_thd, cdata, "net_client_thd");
 		if (ret) {
 			iio_strerror(ret, err_str, sizeof(err_str));
 			ERROR("Failed to create new client thread: %s\n",
 				err_str);
 			close(new);
 			free(cdata);
-			thread_stopped();
 		}
 	}
-
-	pthread_attr_destroy(&attr);
 
 	DEBUG("Cleaning up\n");
 #ifdef HAVE_AVAHI
@@ -422,12 +350,17 @@ err_close_socket:
 int main(int argc, char **argv)
 {
 	bool debug = false, interactive = false, use_aio = false;
+#ifdef WITH_IIOD_USBD
+	long nb_pipes = 3;
+	char *end;
+#endif
 	struct iio_context *ctx;
 	int c, option_index = 0;
+	char *ffs_mountpoint = NULL;
 	char err_str[1024];
 	int ret;
 
-	while ((c = getopt_long(argc, argv, "+hVdDia",
+	while ((c = getopt_long(argc, argv, "+hVdDiaF:n:",
 					options, &option_index)) != -1) {
 		switch (c) {
 		case 'd':
@@ -447,6 +380,26 @@ int main(int argc, char **argv)
 			ERROR("IIOD was not compiled with AIO support.\n");
 			return EXIT_FAILURE;
 #endif
+		case 'F':
+#ifdef WITH_IIOD_USBD
+			ffs_mountpoint = optarg;
+			break;
+#else
+			ERROR("IIOD was not compiled with USB support.\n");
+			return EXIT_FAILURE;
+#endif
+		case 'n':
+#ifdef WITH_IIOD_USBD
+			nb_pipes = strtol(optarg, &end, 10);
+			if (optarg == end || nb_pipes < 1) {
+				ERROR("--nb-pipes: Invalid parameter\n");
+				return EXIT_FAILURE;
+			}
+			break;
+#else
+			ERROR("IIOD was not compiled with USB support.\n");
+			return EXIT_FAILURE;
+#endif
 		case 'h':
 			usage();
 			return EXIT_SUCCESS;
@@ -459,11 +412,19 @@ int main(int argc, char **argv)
 		}
 	}
 
-	stop_fd = eventfd(0, EFD_NONBLOCK);
-	if (stop_fd == -1) {
+	ctx = iio_create_local_context();
+	if (!ctx) {
 		iio_strerror(errno, err_str, sizeof(err_str));
-		ERROR("Unable to create stop eventfd: %s\n", err_str);
+		ERROR("Unable to create local context: %s\n", err_str);
 		return EXIT_FAILURE;
+	}
+
+	main_thread_pool = thread_pool_new();
+	if (!main_thread_pool) {
+		iio_strerror(errno, err_str, sizeof(err_str));
+		ERROR("Unable to create thread pool: %s\n", err_str);
+		ret = EXIT_FAILURE;
+		goto out_destroy_context;
 	}
 
 	set_handler(SIGHUP, sig_handler);
@@ -471,11 +432,20 @@ int main(int argc, char **argv)
 	set_handler(SIGINT, sig_handler);
 	set_handler(SIGTERM, sig_handler);
 
-	ctx = iio_create_local_context();
-	if (!ctx) {
-		iio_strerror(errno, err_str, sizeof(err_str));
-		ERROR("Unable to create local context: %s\n", err_str);
-		return EXIT_FAILURE;
+	if (ffs_mountpoint) {
+#ifdef WITH_IIOD_USBD
+		/* We pass use_aio == true directly, this is ensured to be true
+		 * by the CMake script. */
+		ret = start_usb_daemon(ctx, ffs_mountpoint,
+				debug, true, (unsigned int) nb_pipes,
+				main_thread_pool);
+		if (ret) {
+			iio_strerror(-ret, err_str, sizeof(err_str));
+			ERROR("Unable to start USB daemon: %s\n", err_str);
+			ret = EXIT_FAILURE;
+			goto out_destroy_thread_pool;
+		}
+#endif
 	}
 
 	if (interactive)
@@ -487,11 +457,15 @@ int main(int argc, char **argv)
 	 * In case we got here through an error in the main thread make sure all
 	 * the worker threads are signaled to shutdown.
 	 */
-	sig_handler(SIGTERM);
 
-	wait_for_threads();
+#ifdef WITH_IIOD_USBD
+out_destroy_thread_pool:
+#endif
+	thread_pool_stop_and_wait(main_thread_pool);
+	thread_pool_destroy(main_thread_pool);
+
+out_destroy_context:
 	iio_context_destroy(ctx);
-	close(stop_fd);
 
 	return ret;
 }

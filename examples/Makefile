@@ -14,19 +14,30 @@
 # Lesser General Public License for more details.
 
 
-TARGETS := ad9361-iiostream iio-monitor
+TARGETS := ad9361-iiostream dummy-iiostream iio-monitor
 
 CFLAGS = -Wall
+
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+	CFLAGS += -framework iio
+else
+	LDFLAGS += -liio
+endif
 
 .PHONY: all clean
 
 all: $(TARGETS)
 
 iio-monitor: iio-monitor.o
-	$(CC) -o $@ $^ $(LDFLAGS) -lpthread -lncurses -lcdk -liio
+	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS) -lpthread -lncurses -lcdk
 
 ad9361-iiostream : ad9361-iiostream.o
-	$(CC) -o $@ $^ $(LDFLAGS) -liio
+	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS)
+
+dummy-iiostream : dummy-iiostream.o
+	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS)
 
 clean:
 	rm -f $(TARGETS) $(TARGETS:%=%.o)
